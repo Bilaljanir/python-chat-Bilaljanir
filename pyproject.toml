@@ -1,0 +1,24 @@
+[project]
+name = "python-chat-Bilaljanir"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Bilal Janir", email = "bilaljanir@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+python-chat-bilaljanir = "python_chat_bilaljanir:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.4",
+]

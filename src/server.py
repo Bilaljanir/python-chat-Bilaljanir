@@ -14,6 +14,7 @@ def handle_client(
 ) -> None:
     host, port = address
     console.log(f"[green]Connected:[/] {host}:{port}")
+    conn.settimeout(60)
     with conn:
         try:
             while True:
@@ -21,7 +22,7 @@ def handle_client(
                 if not data:
                     break
                 conn.sendall(data)
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
             pass
     sem.release()
     console.log(f"[red]Disconnected:[/] {host}:{port}")

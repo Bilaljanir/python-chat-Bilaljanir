@@ -1,4 +1,5 @@
 import argparse
+import codecs
 import socket
 import threading
 
@@ -8,6 +9,7 @@ console = Console()
 
 
 def receive_messages(sock: socket.socket, stop: threading.Event) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")()
     try:
         while not stop.is_set():
             data = sock.recv(1024)
@@ -19,7 +21,7 @@ def receive_messages(sock: socket.socket, stop: threading.Event) -> None:
                 except OSError:
                     pass
                 break
-            console.log(data.decode(errors="replace"))
+            console.log(decoder.decode(data))
     except OSError:
         if not stop.is_set():
             console.log("[red]Connection lost.[/]")

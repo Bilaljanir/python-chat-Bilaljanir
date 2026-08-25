@@ -1,6 +1,7 @@
 import argparse
 import socket
 import threading
+import time
 
 from rich.console import Console
 
@@ -14,14 +15,19 @@ def handle_client(
 ) -> None:
     host, port = address
     console.log(f"[green]Connected:[/] {host}:{port}")
-    conn.settimeout(60)
+    deadline = time.monotonic() + 10
     with conn:
         try:
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                conn.settimeout(remaining)
                 data = conn.recv(1024)
                 if not data:
                     break
                 conn.sendall(data)
+                deadline = time.monotonic() + 10
         except (ConnectionError, TimeoutError):
             pass
     sem.release()

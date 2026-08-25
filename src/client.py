@@ -13,11 +13,17 @@ def receive_messages(sock: socket.socket, stop: threading.Event) -> None:
             data = sock.recv(1024)
             if not data:
                 console.log("[yellow]Server closed the connection.[/]")
+                stop.set()
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 break
-            console.log(data.decode())
+            console.log(data.decode(errors="replace"))
     except OSError:
         if not stop.is_set():
             console.log("[red]Connection lost.[/]")
+            stop.set()
 
 
 def main() -> None:
@@ -36,9 +42,8 @@ def main() -> None:
                 target=receive_messages, args=(sock, stop), daemon=True
             )
             thread.start()
-
             try:
-                while True:
+                while not stop.is_set():
                     message = input()
                     if not message:
                         continue
@@ -49,6 +54,7 @@ def main() -> None:
                 stop.set()
     except OSError as e:
         console.log(f"[red]Could not connect:[/] {e}")
+
 
 if __name__ == "__main__":
     main()

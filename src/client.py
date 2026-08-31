@@ -42,7 +42,7 @@ def main() -> None:
             stop = threading.Event()
             thread = threading.Thread(
                 target=receive_messages, args=(sock, stop), daemon=True
-            )
+                )
             thread.start()
             try:
                 while not stop.is_set():

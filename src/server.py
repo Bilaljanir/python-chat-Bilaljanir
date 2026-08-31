@@ -1,4 +1,5 @@
 import argparse
+import codecs
 import socket
 import threading
 import time
@@ -8,14 +9,42 @@ from rich.console import Console
 console = Console()
 
 MAX_CLIENTS = 50
+IDLE_TIMEOUT = 300
+
+clients: dict[socket.socket, tuple[str, int]] = {}
+clients_lock = threading.Lock()
+
+
+def broadcast(message: str, sender: socket.socket | None = None) -> None:
+    data = message.encode()
+    with clients_lock:
+        targets = [s for s in clients if s is not sender]
+    dead = []
+    for sock in targets:
+        try:
+            sock.sendall(data)
+        except OSError:
+            dead.append(sock)
+    if dead:
+        with clients_lock:
+            for sock in dead:
+                clients.pop(sock, None)
 
 
 def handle_client(
-    conn: socket.socket, address: tuple[str, int], sem: threading.Semaphore
+    conn: socket.socket,
+    address: tuple[str, int],
+    sem: threading.Semaphore,
+    idle_timeout: float,
 ) -> None:
     host, port = address
+    with clients_lock:
+        clients[conn] = address
     console.log(f"[green]Connected:[/] {host}:{port}")
-    deadline = time.monotonic() + 10
+    broadcast(f"[{host}:{port}] a rejoint le chat\n", sender=conn)
+
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    deadline = time.monotonic() + idle_timeout
     with conn:
         try:
             while True:
@@ -26,10 +55,17 @@ def handle_client(
                 data = conn.recv(1024)
                 if not data:
                     break
-                conn.sendall(data)
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + idle_timeout
+                text = decoder.decode(data)
+                if not text:
+                    continue
+                broadcast(f"[{host}:{port}] {text}\n", sender=conn)
         except (ConnectionError, TimeoutError):
             pass
+
+    with clients_lock:
+        clients.pop(conn, None)
+    broadcast(f"[{host}:{port}] a quitté le chat\n", sender=conn)
     sem.release()
     console.log(f"[red]Disconnected:[/] {host}:{port}")
 
@@ -45,6 +81,13 @@ def main() -> None:
         type=int,
         default=MAX_CLIENTS,
         help="Max simultaneous connections",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        "-t",
+        type=float,
+        default=IDLE_TIMEOUT,
+        help="Seconds without a message before a client is disconnected",
     )
     args = parser.parse_args()
 
@@ -65,7 +108,7 @@ def main() -> None:
                 conn, address = server_socket.accept()
                 thread = threading.Thread(
                     target=handle_client,
-                    args=(conn, address, sem),
+                    args=(conn, address, sem, args.idle_timeout),
                     daemon=True,
                 )
                 thread.start()

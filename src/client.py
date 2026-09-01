@@ -49,7 +49,7 @@ def main() -> None:
                     message = input()
                     if not message:
                         continue
-                    sock.sendall(message.encode())
+                    sock.sendall(f"{message}\n".encode())
             except (KeyboardInterrupt, EOFError):
                 console.log("\n[yellow]Disconnected.[/]")
             finally:

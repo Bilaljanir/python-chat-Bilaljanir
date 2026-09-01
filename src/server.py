@@ -68,13 +68,17 @@ def handle_client(
                     break
                 deadline = time.monotonic() + idle_timeout
                 buffer += decoder.decode(data)
+                too_long = False
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
+                    if len(line) > MAX_MESSAGE_LEN:
+                        too_long = True
+                        break
                     line = line.rstrip("\r")
                     if not line:
                         continue
                     broadcast(f"[{host}:{port}] {line}\n", sender=conn)
-                if len(buffer) > MAX_MESSAGE_LEN:
+                if too_long or len(buffer) > MAX_MESSAGE_LEN:
                     console.log(f"[yellow]Message too long:[/] {host}:{port}")
                     break
         except (ConnectionError, TimeoutError, OSError):

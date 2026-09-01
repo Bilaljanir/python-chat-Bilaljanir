@@ -42,14 +42,14 @@ def main() -> None:
             stop = threading.Event()
             thread = threading.Thread(
                 target=receive_messages, args=(sock, stop), daemon=True
-            )
+                )
             thread.start()
             try:
                 while not stop.is_set():
                     message = input()
                     if not message:
                         continue
-                    sock.sendall(message.encode())
+                    sock.sendall(f"{message}\n".encode())
             except (KeyboardInterrupt, EOFError):
                 console.log("\n[yellow]Disconnected.[/]")
             finally:

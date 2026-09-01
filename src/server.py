@@ -1,4 +1,6 @@
 import argparse
+import codecs
+import math
 import socket
 import threading
 import time
@@ -8,14 +10,52 @@ from rich.console import Console
 console = Console()
 
 MAX_CLIENTS = 50
+IDLE_TIMEOUT = 300
+MAX_MESSAGE_LEN = 4096
+
+clients: dict[socket.socket, tuple[str, int]] = {}
+clients_lock = threading.Lock()
+
+
+def drop_client(sock: socket.socket) -> None:
+    with clients_lock:
+        clients.pop(sock, None)
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def broadcast(message: str, sender: socket.socket | None = None) -> None:
+    data = message.encode()
+    with clients_lock:
+        targets = [s for s in clients if s is not sender]
+    dead = []
+    for sock in targets:
+        try:
+            sock.sendall(data)
+        except OSError:
+            dead.append(sock)
+
+    for sock in dead:
+        drop_client(sock)
 
 
 def handle_client(
-    conn: socket.socket, address: tuple[str, int], sem: threading.Semaphore
+    conn: socket.socket,
+    address: tuple[str, int],
+    sem: threading.Semaphore,
+    idle_timeout: float,
 ) -> None:
     host, port = address
+    with clients_lock:
+        clients[conn] = address
     console.log(f"[green]Connected:[/] {host}:{port}")
-    deadline = time.monotonic() + 10
+    broadcast(f"[{host}:{port}] a rejoint le chat\n", sender=conn)
+
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    buffer = ""
+    deadline = time.monotonic() + idle_timeout
     with conn:
         try:
             while True:
@@ -26,12 +66,41 @@ def handle_client(
                 data = conn.recv(1024)
                 if not data:
                     break
-                conn.sendall(data)
-                deadline = time.monotonic() + 10
-        except (ConnectionError, TimeoutError):
+                deadline = time.monotonic() + idle_timeout
+                buffer += decoder.decode(data)
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.rstrip("\r")
+                    if not line:
+                        continue
+                    broadcast(f"[{host}:{port}] {line}\n", sender=conn)
+                if len(buffer) > MAX_MESSAGE_LEN:
+                    console.log(f"[yellow]Message too long:[/] {host}:{port}")
+                    break
+        except (ConnectionError, TimeoutError, OSError):
             pass
+
+    with clients_lock:
+        clients.pop(conn, None)
+    broadcast(f"[{host}:{port}] a quitté le chat\n", sender=conn)
     sem.release()
     console.log(f"[red]Disconnected:[/] {host}:{port}")
+
+
+def positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number greater than 0 (got {value!r})"
+        )
+    return number
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0 (got {value!r})")
+    return number
 
 
 def main() -> None:
@@ -42,9 +111,16 @@ def main() -> None:
     parser.add_argument(
         "--max-clients",
         "-m",
-        type=int,
+        type=positive_int,
         default=MAX_CLIENTS,
         help="Max simultaneous connections",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        "-t",
+        type=positive_float,
+        default=IDLE_TIMEOUT,
+        help="Seconds without a message before a client is disconnected",
     )
     args = parser.parse_args()
 
@@ -65,7 +141,7 @@ def main() -> None:
                 conn, address = server_socket.accept()
                 thread = threading.Thread(
                     target=handle_client,
-                    args=(conn, address, sem),
+                    args=(conn, address, sem, args.idle_timeout),
                     daemon=True,
                 )
                 thread.start()

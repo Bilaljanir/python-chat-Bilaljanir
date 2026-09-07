@@ -16,6 +16,19 @@ IDLE_TIMEOUT = 300
 MAX_NAME_ATTEMPTS = 3
 NAME_PATTERN = re.compile(r"^[\w.-]{1,24}$")
 
+def log_safely(message: str) -> None:
+    """Journalise sans jamais lever : un pseudo peut être inaffichable ici.
+
+    L'échappement est fait avant l'écriture, pas en rattrapant l'erreur : rich
+    garde le texte fautif dans son tampon et le réémettrait au message suivant.
+    """
+    encoding = getattr(console.file, "encoding", None) or "utf-8"
+    try:
+        console.log(message.encode(encoding, "backslashreplace").decode(encoding))
+    except Exception:
+        pass
+
+
 clients: dict[socket.socket, str] = {}
 clients_lock = threading.Lock()
 
@@ -94,27 +107,30 @@ def handle_client(
     username: str | None = None
     reader = LineReader(conn, idle_timeout)
 
-    with conn:
+    try:
+        with conn:
+            try:
+                username = negotiate_username(conn, reader.lines())
+                if username is not None:
+                    log_safely(f"[green]Connected:[/] {username} ({host}:{port})")
+                    broadcast(f"[{username}] a rejoint le chat", sender=conn)
+                    relay_messages(conn, username, reader)
+                if reader.timed_out:
+                    send_line(conn, f"Déconnecté après {idle_timeout:g} s sans message.")
+            except MessageTooLong as e:
+                log_safely(f"[yellow]Message too long:[/] {host}:{port} ({e})")
+            except (ConnectionError, TimeoutError, OSError):
+                pass
+    finally:
         try:
-            username = negotiate_username(conn, reader.lines())
-            if username is not None:
-                console.log(f"[green]Connected:[/] {username} ({host}:{port})")
-                broadcast(f"[{username}] a rejoint le chat", sender=conn)
-                relay_messages(conn, username, reader)
-            if reader.timed_out:
-                send_line(conn, f"Déconnecté après {idle_timeout:g} s sans message.")
-        except MessageTooLong as e:
-            console.log(f"[yellow]Message too long:[/] {host}:{port} ({e})")
-        except (ConnectionError, TimeoutError, OSError):
-            pass
-
-    if username is None:
-        console.log(f"[red]Rejected:[/] {host}:{port}")
-    else:
-        release_username(conn)
-        broadcast(f"[{username}] a quitté le chat", sender=conn)
-        console.log(f"[red]Disconnected:[/] {username} ({host}:{port})")
-    sem.release()
+            if username is None:
+                log_safely(f"[red]Rejected:[/] {host}:{port}")
+            else:
+                release_username(conn)
+                broadcast(f"[{username}] a quitté le chat", sender=conn)
+                log_safely(f"[red]Disconnected:[/] {username} ({host}:{port})")
+        finally:
+            sem.release()
 
 def relay_messages(conn: socket.socket, username: str, reader: LineReader) -> None:
     for line in reader.lines():

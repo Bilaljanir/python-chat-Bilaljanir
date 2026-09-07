@@ -3,6 +3,7 @@ import math
 import re
 import socket
 import threading
+import time
 from collections.abc import Iterator
 
 from rich.console import Console
@@ -14,6 +15,7 @@ console = Console()
 MAX_CLIENTS = 50
 IDLE_TIMEOUT = 300
 MAX_NAME_ATTEMPTS = 3
+RETRY_DELAY = 0.1
 NAME_PATTERN = re.compile(r"^[\w.-]{1,24}$")
 
 def log_safely(message: str) -> None:
@@ -179,12 +181,26 @@ def serve(server_socket: socket.socket, max_clients: int, idle_timeout: float) -
     sem = threading.Semaphore(max_clients)
     while True:
         sem.acquire()
-        conn, address = server_socket.accept()
-        threading.Thread(
-            target=handle_client,
-            args=(conn, address, sem, idle_timeout),
-            daemon=True,
-        ).start()
+        conn = None
+        started = False
+        try:
+            conn, address = server_socket.accept()
+            threading.Thread(
+                target=handle_client,
+                args=(conn, address, sem, idle_timeout),
+                daemon=True,
+            ).start()
+            started = True
+        except (OSError, RuntimeError) as e:
+            # Une connexion qui échoue ne doit pas emporter la boucle d'accueil.
+            log_safely(f"[yellow]Connexion abandonnée :[/] {e}")
+            time.sleep(RETRY_DELAY)
+        finally:
+            # Le thread ne possède permis et socket qu'une fois démarré.
+            if not started:
+                sem.release()
+                if conn is not None:
+                    conn.close()
         console.log(f"[blue]Active connections:[/] {threading.active_count() - 1}")
 
 

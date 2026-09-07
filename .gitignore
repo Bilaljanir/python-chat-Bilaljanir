@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environnements et outils
+.venv/
+.ruff_cache/
+
+# IDE
+.idea/

@@ -1,26 +1,128 @@
 import codecs
+import json
 import socket
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 MAX_MESSAGE_LEN = 4096
+MAX_TEXT_LEN = 1024
 RECV_SIZE = 1024
 
-ASK = "ASK"
-ERR = "ERR"
-OK = "OK"
+CHAT = "chat"
+SYSTEM = "system"
+COMMAND = "command"
+
+ASK_USERNAME = "ask_username"
+WELCOME = "welcome"
+ERROR = "error"
+JOIN = "join"
+LEAVE = "leave"
+NOTICE = "notice"
+
+NICK = "nick"
+
+REQUIRED_FIELDS = {
+    CHAT: ("text",),
+    SYSTEM: ("event", "text"),
+    COMMAND: ("name",),
+}
 
 
 class MessageTooLong(Exception):
     """Une ligne dépasse MAX_MESSAGE_LEN caractères."""
 
+class InvalidMessage(Exception):
+    """La ligne reçue n'est pas un message conforme au protocole."""
+
+def chat_message(text: str, username: str | None = None) -> dict:
+    payload = {"text": text}
+    if username is not None:
+        payload["username"] = username
+    return {"type": CHAT, "payload": payload}
+
+
+def system_message(event: str, text: str, **extra: str) -> dict:
+    return {"type": SYSTEM, "payload": {"event": event, "text": text, **extra}}
+
+
+def command_message(name: str, *args: str) -> dict:
+    return {"type": COMMAND, "payload": {"name": name, "args": list(args)}}
+
+
+def encode(message: dict) -> str:
+    return json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+
+
+def decode(line: str) -> dict:
+
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError as e:
+        raise InvalidMessage(f"JSON illisible : {e}") from e
+    except RecursionError as e:
+        raise InvalidMessage("JSON trop imbriqué") from e
+
+    if not isinstance(message, dict):
+        raise InvalidMessage("le message n'est pas un objet JSON")
+
+    message_type = message.get("type")
+    if message_type not in REQUIRED_FIELDS:
+        raise InvalidMessage(f"type inconnu : {message_type!r}")
+
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        raise InvalidMessage("« payload » absent ou n'est pas un objet")
+
+    _check_payload(message_type, payload)
+    return {"type": message_type, "payload": payload}
+
+
+def _check_payload(message_type: str, payload: dict) -> None:
+    for field in REQUIRED_FIELDS[message_type]:
+        if not isinstance(payload.get(field), str):
+            raise InvalidMessage(
+                f"champ « {field} » absent ou non textuel dans un message {message_type}"
+            )
+
+    if message_type == CHAT:
+        _check_optional_text(payload, "username")
+    elif message_type == COMMAND:
+        # Normalisé ici pour que le reste du code puisse écrire payload["args"].
+        payload["args"] = _checked_args(payload.get("args", []))
+
+
+def _check_optional_text(payload: dict, field: str) -> None:
+    if field in payload and not isinstance(payload[field], str):
+        raise InvalidMessage(f"champ « {field} » non textuel")
+
+
+def _checked_args(args: object) -> list[str]:
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        raise InvalidMessage("« args » doit être une liste de chaînes")
+    return args
+
+
 def send_line(sock: socket.socket, text: str) -> None:
     sock.sendall(f"{text}\n".encode())
 
 
-def split_tag(line: str) -> tuple[str, str]:
-    tag, _, rest = line.partition(" ")
-    return tag, rest
+def send_message(sock: socket.socket, message: dict) -> None:
+    send_line(sock, encode(message))
+
+def iter_messages(
+    reader: "LineReader",
+    on_invalid: Callable[[str, InvalidMessage], None],
+) -> Iterator[dict]:
+    for line in reader.lines():
+        if not line.strip():
+            continue
+        try:
+            message = decode(line)
+        except InvalidMessage as e:
+            on_invalid(line, e)
+            continue
+        yield message
+
 
 class LineReader:
 

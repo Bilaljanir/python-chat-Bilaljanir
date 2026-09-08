@@ -1,7 +1,9 @@
 # python-chat
 
 Un chat de groupe en TCP : un serveur, plusieurs clients dans un terminal.
-Écrit avec la bibliothèque standard uniquement (`socket`, `threading`), plus
+Les deux bouts parlent un protocole **JSON délimité par des sauts de ligne**
+(voir [Le protocole](#3-le-protocole)). Écrit avec la bibliothèque standard
+uniquement (`socket`, `threading`, `json`), plus
 [rich](https://rich.readthedocs.io/) pour l'affichage.
 
 ```
@@ -45,67 +47,128 @@ Le client demande un pseudo, puis tout ce que vous tapez part vers les autres.
 
 ```
 src/
-├── protocol.py   ce qui est commun aux deux bouts : format des lignes, lecture du flux
+├── protocol.py   ce qui est commun aux deux bouts : format des messages, lecture du flux
 ├── server.py     accepte les connexions, tient le registre des pseudos, diffuse
 └── client.py     demande le pseudo, envoie ce qu'on tape, affiche ce qui arrive
 ```
 
 La règle de partage est simple : **tout ce que le serveur et le client doivent
 comprendre de la même façon vit dans `protocol.py`.** Si les deux côtés
-interprétaient différemment la fin d'une ligne ou le préfixe `OK`, ils ne se
-comprendraient plus.
+interprétaient différemment la fin d'une ligne ou le nom d'un champ, ils ne se
+comprendraient plus. C'est pourquoi personne n'appelle `json.dumps` ailleurs :
+les messages se construisent avec `chat_message()`, `system_message()` et
+`command_message()`, et se lisent avec `decode()`.
 
 ---
 
 ## 3. Le protocole
 
-Le protocole est **textuel et orienté ligne** : un message = une ligne
-terminée par `\n`. C'est le choix le plus simple qui fonctionne, et il se
-teste à la main avec `nc`.
+**Un message = un objet JSON sur une ligne, terminé par `\n`, encodé en
+UTF-8** (*newline-delimited JSON*). Chaque objet a exactement deux champs :
 
-### Phase 1 — la poignée de main (choix du pseudo)
+```json
+{"type": "chat", "payload": {"username": "alice", "text": "salut bob"}}
+```
 
-Le serveur préfixe ses lignes par un mot-clé :
+- **`type`** dit comment lire la suite ;
+- **`payload`** porte les données propres à ce type.
 
-| Ligne du serveur | Sens | Réaction du client |
+Pourquoi pas du texte brut préfixé (`OK alice`) ? Parce que dès qu'un message
+porte deux informations — l'auteur *et* le texte, l'événement *et* son
+libellé — il faut inventer un séparateur, puis se demander ce qui se passe
+quand ce séparateur apparaît dans le texte. JSON tranche la question une fois
+pour toutes, et `json` est dans la bibliothèque standard. Le `\n` reste le
+délimiteur : il ne peut pas apparaître dans une ligne JSON, où il s'écrit
+`\\n`.
+
+### Les trois types
+
+| `type` | Sens | Émis par | Champs du `payload` |
+|---|---|---|---|
+| `chat` | un message de discussion | client → serveur → les autres | `text`, plus `username` quand le serveur rediffuse |
+| `system` | une notification du serveur | serveur | `event`, `text`, parfois `username` |
+| `command` | une demande du client | client | `name`, `args` (liste de chaînes) |
+
+Un `chat` venant du client ne porte que `text` : **c'est le serveur qui
+attache l'auteur**, pris dans son registre. Un `username` glissé par le client
+dans son payload est ignoré — sans quoi n'importe qui parlerait sous le nom
+d'un autre.
+
+### Les événements `system`
+
+| `event` | Quand | Champ en plus |
 |---|---|---|
-| `ASK Choisissez un pseudo` | donne-moi un pseudo | affiche l'invite, envoie la réponse |
-| `ERR Ce pseudo est déjà utilisé...` | refusé, voici pourquoi | affiche en rouge, attend le prochain `ASK` |
-| `OK alice` | accepté | le chat commence |
+| `ask_username` | le serveur réclame un pseudo | |
+| `error` | pseudo refusé, commande inconnue, message rejeté | |
+| `welcome` | pseudo accepté | `username` |
+| `join` | un client rejoint le chat | `username` |
+| `leave` | un client quitte le chat | `username` |
+| `notice` | information, par exemple la fermeture pour inactivité | |
 
-### Phase 2 — le chat
+`text` est toujours prêt à afficher ; `event` existe pour que le code décide
+(couleur, fin de la poignée de main) **sans avoir à lire le français**.
 
-Plus de préfixe : chaque ligne est du texte à afficher tel quel.
+### Les commandes
 
+Une seule pour l'instant, celle de la poignée de main ; les commandes tapées
+par l'utilisateur (`/quit`, `/list`…) viendront s'ajouter ici.
+
+```json
+{"type": "command", "payload": {"name": "nick", "args": ["alice"]}}
 ```
-[alice] a rejoint le chat
-[alice]: salut bob
-[alice] a quitté le chat
-```
+
+`args` est toujours une liste de chaînes, même vide : le code qui traite une
+commande n'a jamais à en vérifier le type.
 
 ### Un échange complet
 
 ```
-client                                  serveur
-  |                                        |
-  |------------- connexion TCP ----------->|   thread créé
-  |<---- ASK Choisissez un pseudo ---------|
-  |------ alice -------------------------->|   claim_username()  -> libre
-  |<---- OK alice -------------------------|   clients[sock] = "alice"
-  |                                        |   broadcast -> les autres
-  |                                        |     "[alice] a rejoint le chat"
-  |------ salut bob ---------------------->|   broadcast -> les autres
-  |                                        |     "[alice]: salut bob"
-  |<---- [bob]: salut alice ---------------|
-  |                                        |
-  |------------- Ctrl-C ------------------>|   recv rend b"" -> fin du thread
-                                           |   broadcast -> les autres
-                                           |     "[alice] a quitté le chat"
+client                                              serveur
+  |                                                    |
+  |--------------- connexion TCP --------------------->|  thread créé
+  |<-- {"type":"system","payload":{"event":"ask_username","text":"Choisissez un pseudo"}}
+  |--> {"type":"command","payload":{"name":"nick","args":["alice"]}}
+  |                                                    |  claim_username() -> libre
+  |<-- {"type":"system","payload":{"event":"welcome","username":"alice",...}}
+  |                                                    |  broadcast -> les autres
+  |                                                    |    system / join / alice
+  |--> {"type":"chat","payload":{"text":"salut bob"}}
+  |                                                    |  broadcast -> les autres
+  |                                                    |    chat / alice / "salut bob"
+  |<-- {"type":"chat","payload":{"username":"bob","text":"salut alice"}}
+  |                                                    |
+  |--------------- Ctrl-C ---------------------------->|  recv rend b"" -> fin du thread
+                                                       |  broadcast -> les autres
+                                                       |    system / leave / alice
 ```
 
 Si le pseudo est pris, le serveur **redemande sur la même connexion** au lieu
 de couper — le client n'a pas à se reconnecter. Au bout de 3 refus, la
 connexion est fermée.
+
+### Un message invalide est journalisé, jamais fatal
+
+`decode()` refuse une ligne dès qu'elle ne tient pas debout :
+
+| Ligne reçue | Refus |
+|---|---|
+| `pas du json` | JSON illisible |
+| `[1,2,3]` | le message n'est pas un objet JSON |
+| `{"type":"chat"}` | `payload` absent ou n'est pas un objet |
+| `{"type":"zorglub","payload":{}}` | type inconnu |
+| `{"type":"chat","payload":{}}` | champ `text` absent ou non textuel |
+| `{"type":"command","payload":{"name":"nick","args":[42]}}` | `args` n'est pas une liste de chaînes |
+
+`iter_messages()` attrape ce refus, le signale et **passe à la ligne
+suivante** : le serveur l'écrit dans son journal, le client l'affiche en
+grisé, et la connexion continue. C'est le seul endroit où ce « journaliser et
+ignorer » est écrit, pour les deux bouts.
+
+En échange, `decode()` garantit à ses appelants que `message["type"]` est l'un
+des trois types connus, que `message["payload"]` est un dictionnaire et que
+les champs obligatoires de ce type sont présents et textuels. Sans ce
+contrat, chaque `payload["text"]` du serveur et du client serait un `KeyError`
+déclenchable à distance.
 
 ---
 
@@ -136,10 +199,15 @@ suivant.
 `LineReader` règle les trois d'un coup :
 
 ```python
-lines = LineReader(sock, idle_timeout).lines()
-for line in lines:          # une ligne = un message, garanti
+reader = LineReader(sock, idle_timeout)
+messages = iter_messages(reader, on_invalid)   # lignes -> messages décodés
+for message in messages:    # un tour = un message complet et conforme
     ...
 ```
+
+Les deux étages sont séparés exprès : `LineReader` ne connaît que les octets
+et les `\n`, `iter_messages` ne connaît que le JSON. Le premier n'a pas eu à
+changer quand le protocole est passé du texte brut au JSON.
 
 ### Comment il s'y prend
 
@@ -150,6 +218,7 @@ for line in lines:          # une ligne = un message, garanti
 | `_fill_buffer()` | un `recv`, l'ajoute au tampon ; `False` quand le flux se termine |
 | `_arm_timeout()` | arme le délai avant le prochain `recv` |
 | `_reject_if_too_long()` | la limite `MAX_MESSAGE_LEN`, en un seul endroit |
+| `iter_messages()` | décode chaque ligne ; signale et saute les invalides |
 
 Deux détails qui ont leur importance :
 
@@ -197,7 +266,7 @@ envoyer ?* (les clés) et *quel pseudo est déjà pris ?* (les valeurs).
 
 ```python
 def broadcast(message, sender=None):
-    data = f"{message}\n".encode()
+    data = f"{encode(message)}\n".encode()   # sérialisé une fois pour tous
     with clients_lock:
         targets = [sock for sock in clients if sock is not sender]   # copie
     unreachable = [sock for sock in targets if not try_send(sock, data)]
@@ -208,7 +277,8 @@ def broadcast(message, sender=None):
 Trois décisions dans ces six lignes :
 
 1. **`sock is not sender`** : c'est ce qui implémente « l'auteur ne reçoit pas
-   son propre message ».
+   son propre message ». Le message est aussi **sérialisé une seule fois**,
+   avant la boucle : le JSON envoyé est identique pour tous les destinataires.
 2. **Le verrou n'est tenu que pour la copie**, pas pendant les envois. Un
    `sendall` peut bloquer si le tampon d'un client est plein ; le tenir sous
    verrou figerait tout le chat à cause d'un seul client lent.
@@ -227,11 +297,11 @@ handle_client()
    │
    ├─ negotiate_username()      jusqu'à 3 essais ─┐ échec → "Rejected", release
    │                                              ↓ succès
-   ├─ broadcast("[x] a rejoint le chat")
+   ├─ broadcast(system_message(JOIN, "x a rejoint le chat"))
    ├─ relay_messages()          boucle jusqu'à déconnexion ou silence
    │
    └─ retrait du registre
-      broadcast("[x] a quitté le chat")
+      broadcast(system_message(LEAVE, "x a quitté le chat"))
       sem.release()
 ```
 
@@ -244,8 +314,14 @@ temps** :
 
 | Thread | Rôle | Fonction |
 |---|---|---|
-| principal | `input()` → `send_line()` | `send_user_input()` |
-| secondaire | `recv` → affichage | `receive_messages()` |
+| principal | `input()` → `chat_message()` → `send_message()` | `send_user_input()` |
+| secondaire | `recv` → `decode()` → affichage | `receive_messages()` |
+
+L'affichage est le seul endroit du client qui traduit un message en texte :
+`display()` met la couleur d'après `payload["event"]` et écrit
+`[alice]: salut` à partir de `username` et `text`. Le format d'affichage n'est
+donc plus imposé par le réseau — le serveur envoie des données, le client
+choisit comment les montrer.
 
 Deux subtilités valent l'explication :
 
@@ -295,7 +371,7 @@ générale : **une décision prise à partir d'un état partagé doit être appl
 sans relâcher le verrou entre-temps.**
 
 Un test dédié lance 20 threads réclamant le même pseudo simultanément et vérifie
-qu'un seul reçoit `OK`.
+qu'un seul reçoit un message système `welcome`.
 
 ### Ce qui n'a pas besoin de verrou
 
@@ -321,6 +397,17 @@ la forme actuelle du code.
 | `--idle-timeout inf` gelait une place | valeur non validée, exception avant `sem.release()` | validée par argparse |
 | une ligne trop longue passait quand même | la limite ne visait que le reliquat | contrôle sur la ligne extraite |
 
+### Deux pièges propres au passage au JSON
+
+- **Lire un `payload` sans le valider.** Un `payload["text"]` sur un message
+  incomplet est un `KeyError` — donc un thread client qui meurt — déclenchable
+  par n'importe quel pair. D'où la validation centralisée dans `decode()`.
+- **L'enveloppe compte dans la longueur de la ligne.** Un texte de 4000
+  caractères tient sous `MAX_MESSAGE_LEN`, mais pas une fois entouré de son
+  JSON : la ligne serait rejetée et la connexion fermée, sans explication.
+  D'où `MAX_TEXT_LEN`, nettement plus bas, vérifié par le client avant
+  l'envoi et par le serveur à la réception.
+
 ---
 
 ## 9. Paramètres
@@ -340,7 +427,8 @@ la forme actuelle du code.
 
 | Nom | Valeur | Fichier | Rôle |
 |---|---|---|---|
-| `MAX_MESSAGE_LEN` | 4096 | `protocol.py` | longueur maximale d'une ligne |
+| `MAX_MESSAGE_LEN` | 4096 | `protocol.py` | longueur maximale d'une ligne JSON |
+| `MAX_TEXT_LEN` | 1024 | `protocol.py` | longueur maximale d'un texte de chat |
 | `RECV_SIZE` | 1024 | `protocol.py` | taille d'un bloc lu |
 | `MAX_NAME_ATTEMPTS` | 3 | `server.py` | essais de pseudo avant fermeture |
 | `NAME_PATTERN` | `^[\w.-]{1,24}$` | `server.py` | pseudos acceptés |
@@ -359,24 +447,31 @@ Un serveur, deux clients, et on vérifie :
 
 | Action | Attendu |
 |---|---|
-| bob se connecte | alice voit `[bob] a rejoint le chat` |
+| bob se connecte | alice voit `bob a rejoint le chat` |
 | bob tape `salut` | alice voit `[bob]: salut`, bob ne voit rien |
 | un 3ᵉ client tape `alice` | refus, puis nouvelle invite |
 | il tape `ALICE` | refus aussi |
 | il tape `a b` | `Pseudo invalide : ...` |
 | 3 refus d'affilée | connexion fermée |
-| `Ctrl-C` sur bob | alice voit `[bob] a quitté le chat` |
+| `Ctrl-C` sur bob | alice voit `bob a quitté le chat` |
 
 ### Sans client
 
-`nc` suffit pour voir le protocole brut :
+`nc` suffit pour voir le protocole brut — et pour l'écrire à la main :
 
 ```fish
 nc localhost 12345
-ASK Choisissez un pseudo      # <- le serveur
-alice                          # <- vous
-OK alice                       # <- le serveur
+{"type":"system","payload":{"event":"ask_username","text":"Choisissez un pseudo"}}
+{"type":"command","payload":{"name":"nick","args":["alice"]}}
+{"type":"system","payload":{"event":"welcome","text":"Connecté en tant que alice","username":"alice"}}
+{"type":"chat","payload":{"text":"salut"}}
 ```
+
+(les lignes 1 et 3 viennent du serveur, les lignes 2 et 4 sont tapées.)
+
+C'est aussi le moyen de vérifier le traitement des messages invalides : tapez
+`n'importe quoi`, puis `{"type":"chat"}`. Le serveur journalise deux refus,
+**garde la connexion ouverte**, et le message suivant passe normalement.
 
 ---
 
@@ -384,8 +479,8 @@ OK alice                       # <- le serveur
 
 Dans cet ordre, chaque fichier s'appuie sur le précédent :
 
-1. **`protocol.py`** — le format des lignes et `LineReader`. Une fois compris
-   que TCP ne découpe pas les messages, le reste coule de source.
+1. **`protocol.py`** — le format des messages, puis `LineReader`. Une fois
+   compris que TCP ne découpe pas les messages, le reste coule de source.
 2. **`server.py`, `handle_client()`** — la vie d'un client de bout en bout ;
    les autres fonctions du serveur ne sont que ses étapes détaillées.
 3. **`server.py`, `broadcast()` et `claim_username()`** — les deux endroits où

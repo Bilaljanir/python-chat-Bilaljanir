@@ -4,11 +4,31 @@ import re
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from rich.console import Console
+from rich.markup import escape
 
-from protocol import ASK, ERR, OK, LineReader, MessageTooLong, send_line
+from protocol import (
+    ASK_USERNAME,
+    CHAT,
+    COMMAND,
+    ERROR,
+    JOIN,
+    LEAVE,
+    MAX_TEXT_LEN,
+    NICK,
+    NOTICE,
+    WELCOME,
+    InvalidMessage,
+    LineReader,
+    MessageTooLong,
+    chat_message,
+    encode,
+    iter_messages,
+    send_message,
+    system_message,
+)
 
 console = Console()
 
@@ -16,14 +36,10 @@ MAX_CLIENTS = 50
 IDLE_TIMEOUT = 300
 MAX_NAME_ATTEMPTS = 3
 RETRY_DELAY = 0.1
+LOG_EXCERPT_LEN = 120
 NAME_PATTERN = re.compile(r"^[\w.-]{1,24}$")
 
 def log_safely(message: str) -> None:
-    """Journalise sans jamais lever : un pseudo peut être inaffichable ici.
-
-    L'échappement est fait avant l'écriture, pas en rattrapant l'erreur : rich
-    garde le texte fautif dans son tampon et le réémettrait au message suivant.
-    """
     encoding = getattr(console.file, "encoding", None) or "utf-8"
     try:
         console.log(message.encode(encoding, "backslashreplace").decode(encoding))
@@ -48,9 +64,8 @@ def drop_client(sock: socket.socket) -> None:
         pass
 
 
-def broadcast(message: str, sender: socket.socket | None = None) -> None:
-    """Envoie une ligne à tous les clients sauf l'expéditeur."""
-    data = f"{message}\n".encode()
+def broadcast(message: dict, sender: socket.socket | None = None) -> None:
+    data = f"{encode(message)}\n".encode()
     with clients_lock:
         targets = [sock for sock in clients if sock is not sender]
 
@@ -76,28 +91,58 @@ def claim_username(conn: socket.socket, name: str) -> str | None:
         clients[conn] = name
     return None
 
+def invalid_message_logger(
+    address: tuple[str, int],
+) -> Callable[[str, InvalidMessage], None]:
+    host, port = address
 
-def negotiate_username(conn: socket.socket, lines: Iterator[str]) -> str | None:
+    def report(line: str, error: InvalidMessage) -> None:
+        excerpt = escape(line[:LOG_EXCERPT_LEN])
+        log_safely(f"[yellow]Message invalide de[/] {host}:{port} : {error} — {excerpt}")
+
+    return report
+
+
+def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | None:
 
     for _ in range(MAX_NAME_ATTEMPTS):
-        send_line(conn, f"{ASK} Choisissez un pseudo")
-        proposal = next(lines, None)
-        if proposal is None:
+        send_message(conn, system_message(ASK_USERNAME, "Choisissez un pseudo"))
+        message = next(messages, None)
+        if message is None:
             return None
 
-        name = proposal.strip()
+        name = username_proposal(message)
+        if name is None:
+            send_message(
+                conn,
+                system_message(ERROR, "Envoyez la commande « nick <pseudo> »."),
+            )
+            continue
+
         refusal = claim_username(conn, name)
         if refusal is None:
             try:
-                send_line(conn, f"{OK} {name}")
+                send_message(
+                    conn,
+                    system_message(
+                        WELCOME, f"Connecté en tant que {name}", username=name
+                    ),
+                )
             except OSError:
                 release_username(conn)
                 raise
             return name
-        send_line(conn, f"{ERR} {refusal}")
+        send_message(conn, system_message(ERROR, refusal))
 
-    send_line(conn, f"{ERR} Trop de tentatives, connexion fermée.")
+    send_message(conn, system_message(ERROR, "Trop de tentatives, connexion fermée."))
     return None
+
+def username_proposal(message: dict) -> str | None:
+    payload = message["payload"]
+    if message["type"] != COMMAND or payload["name"] != NICK:
+        return None
+    name = payload["args"][0].strip() if payload["args"] else ""
+    return name or None
 
 def handle_client(
     conn: socket.socket,
@@ -108,17 +153,29 @@ def handle_client(
     host, port = address
     username: str | None = None
     reader = LineReader(conn, idle_timeout)
+    messages = iter_messages(reader, invalid_message_logger(address))
 
     try:
         with conn:
             try:
-                username = negotiate_username(conn, reader.lines())
+                username = negotiate_username(conn, messages)
                 if username is not None:
                     log_safely(f"[green]Connected:[/] {username} ({host}:{port})")
-                    broadcast(f"[{username}] a rejoint le chat", sender=conn)
-                    relay_messages(conn, username, reader)
+                    broadcast(
+                        system_message(
+                            JOIN, f"{username} a rejoint le chat", username=username
+                        ),
+                        sender=conn,
+                    )
+                    relay_messages(conn, username, messages)
                 if reader.timed_out:
-                    send_line(conn, f"Déconnecté après {idle_timeout:g} s sans message.")
+                    send_message(
+                        conn,
+                        system_message(
+                            NOTICE,
+                            f"Déconnecté après {idle_timeout:g} s sans message.",
+                        ),
+                    )
             except MessageTooLong as e:
                 log_safely(f"[yellow]Message too long:[/] {host}:{port} ({e})")
             except (ConnectionError, TimeoutError, OSError):
@@ -129,15 +186,44 @@ def handle_client(
                 log_safely(f"[red]Rejected:[/] {host}:{port}")
             else:
                 release_username(conn)
-                broadcast(f"[{username}] a quitté le chat", sender=conn)
+                broadcast(
+                    system_message(
+                        LEAVE, f"{username} a quitté le chat", username=username
+                    ),
+                    sender=conn,
+                )
                 log_safely(f"[red]Disconnected:[/] {username} ({host}:{port})")
         finally:
             sem.release()
 
-def relay_messages(conn: socket.socket, username: str, reader: LineReader) -> None:
-    for line in reader.lines():
-        if line:
-            broadcast(f"[{username}]: {line}", sender=conn)
+def relay_messages(
+    conn: socket.socket, username: str, messages: Iterator[dict]
+) -> None:
+    for message in messages:
+        relay_one(conn, username, message)
+
+
+def relay_one(conn: socket.socket, username: str, message: dict) -> None:
+    payload = message["payload"]
+    if message["type"] == COMMAND:
+        send_message(
+            conn, system_message(ERROR, f"Commande inconnue : {payload['name']}")
+        )
+        return
+    if message["type"] != CHAT:
+        send_message(conn, system_message(ERROR, "Type de message inattendu ici."))
+        return
+
+    text = payload["text"].strip()
+    if not text:
+        return
+    if len(text) > MAX_TEXT_LEN:
+        send_message(
+            conn,
+            system_message(ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."),
+        )
+        return
+    broadcast(chat_message(text, username=username), sender=conn)
 
 
 def positive_float(value: str) -> float:
@@ -196,7 +282,6 @@ def serve(server_socket: socket.socket, max_clients: int, idle_timeout: float) -
             log_safely(f"[yellow]Connexion abandonnée :[/] {e}")
             time.sleep(RETRY_DELAY)
         finally:
-            # Le thread ne possède permis et socket qu'une fois démarré.
             if not started:
                 sem.release()
                 if conn is not None:

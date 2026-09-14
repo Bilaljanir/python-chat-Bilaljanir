@@ -39,7 +39,8 @@ uv run python src/client.py localhost 12345
 ```
 
 Le client demande un pseudo, puis tout ce que vous tapez part vers les autres.
-`Ctrl-C` ou `Ctrl-D` pour quitter.
+Les lignes commençant par `/` sont des commandes : `/help`, `/users`,
+`/nick <pseudo>`, `/quit`. `Ctrl-C` ou `Ctrl-D` quittent aussi.
 
 ---
 
@@ -103,6 +104,8 @@ d'un autre.
 | `welcome` | pseudo accepté | `username` |
 | `join` | un client rejoint le chat | `username` |
 | `leave` | un client quitte le chat | `username` |
+| `rename` | un client a changé de pseudo | `username` (l'ancien), `new_username` |
+| `user_list` | réponse à `/users` | `users` (liste de pseudos) |
 | `notice` | information, par exemple la fermeture pour inactivité | |
 
 `text` est toujours prêt à afficher ; `event` existe pour que le code décide
@@ -110,15 +113,21 @@ d'un autre.
 
 ### Les commandes
 
-Une seule pour l'instant, celle de la poignée de main ; les commandes tapées
-par l'utilisateur (`/quit`, `/list`…) viendront s'ajouter ici.
-
 ```json
 {"type": "command", "payload": {"name": "nick", "args": ["alice"]}}
 ```
 
 `args` est toujours une liste de chaînes, même vide : le code qui traite une
 commande n'a jamais à en vérifier le type.
+
+| `name` | Envoyée quand | Réponse du serveur |
+|---|---|---|
+| `nick` | poignée de main, puis `/nick <pseudo>` | `welcome` ou `rename`, ou `error` si le pseudo est pris |
+| `users` | `/users` | `user_list` |
+| `quit` | `/quit` | aucune : le serveur termine la session et diffuse `leave` |
+
+Une commande inconnue reçoit un `system` / `error` — le serveur ne suppose
+jamais que son pair est le client de ce dépôt.
 
 ### Un échange complet
 
@@ -260,7 +269,27 @@ clients_lock = threading.Lock()
 ```
 
 Un dictionnaire, parce qu'il répond aux deux questions du chat : *à qui dois-je
-envoyer ?* (les clés) et *quel pseudo est déjà pris ?* (les valeurs).
+envoyer ?* (les clés) et *quel pseudo est déjà pris ?* (les valeurs). Il répond
+aussi aux deux commandes ajoutées ensuite : `/users` lit ses valeurs, `/nick`
+en remplace une.
+
+Depuis `/nick`, **le pseudo n'est plus une variable de `handle_client`** : il
+est relu dans le registre à chaque message relayé (`current_username(conn)`).
+Une variable locale aurait continué à attribuer les messages à l'ancien nom, et
+le `leave` de fin de session aurait annoncé le départ de quelqu'un qui n'existe
+plus.
+
+`claim_username` sert les deux cas — poignée de main et renommage — grâce à une
+condition unique :
+
+```python
+if any(sock is not conn and taken.casefold() == name.casefold()
+       for sock, taken in clients.items()):
+```
+
+Le `sock is not conn` est ce qui permet à `alice` de devenir `ALICE` : on
+ignore sa propre entrée dans le test d'unicité, sans quoi tout renommage
+buterait sur son propre pseudo.
 
 ### La diffusion
 
@@ -322,6 +351,38 @@ L'affichage est le seul endroit du client qui traduit un message en texte :
 `[alice]: salut` à partir de `username` et `text`. Le format d'affichage n'est
 donc plus imposé par le réseau — le serveur envoie des données, le client
 choisit comment les montrer.
+
+### Les commandes
+
+Tout ce qui commence par `/` est **intercepté avant l'envoi** : une commande
+n'est jamais diffusée comme un message ordinaire.
+
+| Tapé | Traité où | Effet |
+|---|---|---|
+| `/help` | entièrement sur le client | affiche la liste des commandes |
+| `/users` | envoi de `command`/`users` | le serveur répond `user_list`, affiché tel quel |
+| `/nick <pseudo>` | envoi de `command`/`nick` | pseudo changé si libre, les autres reçoivent `rename` |
+| `/quit` | envoi de `command`/`quit`, puis sortie | le serveur clôt la session et diffuse `leave` |
+| `/autre` | entièrement sur le client | `Commande inconnue : /autre — tapez /help` |
+
+```python
+name, _, rest = text[1:].partition(" ")
+return name.casefold(), rest.split()
+```
+
+Deux conséquences de ce découpage :
+
+- **Le client connaît la liste des commandes**, donc une faute de frappe est
+  signalée immédiatement, sans aller-retour réseau ni ligne inutile envoyée au
+  serveur. `/nick` sans argument affiche son usage au lieu d'envoyer une
+  commande vide.
+- **Le serveur ne fait confiance à personne** : il revalide le pseudo et
+  répond `error` à une commande qu'il ne connaît pas. `nc` peut envoyer
+  n'importe quoi, le client n'est pas le seul garde-fou.
+
+Le pseudo affiché après un `/nick` vient du serveur, jamais d'une variable
+locale : c'est le registre qui fait foi, et les messages suivants sont
+attribués au nouveau nom sans que le client ait à s'en souvenir.
 
 Deux subtilités valent l'explication :
 
@@ -454,6 +515,19 @@ Un serveur, deux clients, et on vérifie :
 | il tape `a b` | `Pseudo invalide : ...` |
 | 3 refus d'affilée | connexion fermée |
 | `Ctrl-C` sur bob | alice voit `bob a quitté le chat` |
+
+Puis les commandes :
+
+| Action | Attendu |
+|---|---|
+| bob tape `/help` | la liste s'affiche chez bob, alice ne voit rien |
+| bob tape `/bidule` | `Commande inconnue : /bidule`, rien n'est envoyé |
+| bob tape `/users` | `Connectés (2) : alice, bob` |
+| bob tape `/nick carol` | bob voit `Vous êtes désormais carol`, alice voit `bob est désormais carol` |
+| carol tape `salut` | alice voit `[carol]: salut` (et non `[bob]`) |
+| carol tape `/nick alice` | refus : le pseudo est pris |
+| carol tape `/nick CAROL` | accepté : changer la casse de son propre pseudo est permis |
+| carol tape `/quit` | carol sort, alice voit `CAROL a quitté le chat` |
 
 ### Sans client
 

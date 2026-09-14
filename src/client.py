@@ -179,7 +179,7 @@ def receive_messages(
         for message in messages:
             if stop.is_set():
                 return
-        display(message, session)
+            display(message, session)
     except (OSError, MessageTooLong):
         pass
 
@@ -219,7 +219,8 @@ def send_user_input(
             send_message(sock, chat_message(text))
             ui.emit(ui.chat_line(session.username, text, mine=True))
     except (KeyboardInterrupt, EOFError):
-        ui.emit(ui.system_line("Déconnecté.", "italic yellow"))
+        if not stop.is_set():
+            ui.emit(ui.system_line("Déconnecté.", "italic yellow"))
     finally:
         stop.set()
 

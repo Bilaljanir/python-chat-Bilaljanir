@@ -11,11 +11,16 @@ from protocol import (
     ASK_USERNAME,
     CHAT,
     ERROR,
+    HELP,
     JOIN,
     LEAVE,
     MAX_TEXT_LEN,
     NICK,
+    QUIT,
+    RENAME,
     SYSTEM,
+    USER_LIST,
+    USERS,
     WELCOME,
     InvalidMessage,
     LineReader,
@@ -28,7 +33,21 @@ from protocol import (
 
 console = Console()
 
-SYSTEM_STYLES = {ERROR: "red", JOIN: "cyan", LEAVE: "cyan", WELCOME: "green"}
+SYSTEM_STYLES = {
+    ERROR: "red",
+    JOIN: "cyan",
+    LEAVE: "cyan",
+    RENAME: "cyan",
+    USER_LIST: "cyan",
+    WELCOME: "green",
+}
+
+COMMAND_HELP = {
+    HELP: ("/help", "affiche cette aide"),
+    USERS: ("/users", "liste les utilisateurs connectés"),
+    NICK: ("/nick <pseudo>", "change de pseudo"),
+    QUIT: ("/quit", "quitte le chat"),
+}
 
 
 def show(line: str, style: str | None = None) -> None:
@@ -46,6 +65,58 @@ def display(message: dict) -> None:
     elif message["type"] == SYSTEM:
         show(payload["text"], style=SYSTEM_STYLES.get(payload["event"], "yellow"))
 
+def parse_command(text: str) -> tuple[str, list[str]]:
+    name, _, rest = text[1:].partition(" ")
+    return name.casefold(), rest.split()
+
+
+def show_help() -> None:
+    show("Commandes disponibles :", style="cyan")
+    for usage, description in COMMAND_HELP.values():
+        show(f"  {usage:<16}{description}", style="cyan")
+    show("  toute autre ligne est envoyée comme message", style="dim cyan")
+
+
+def run_command(sock: socket.socket, text: str) -> bool:
+    name, args = parse_command(text)
+    if name == HELP:
+        show_help()
+    elif name == QUIT:
+        send_message(sock, command_message(QUIT))
+        show("Déconnecté.", style="yellow")
+        return False
+    elif name == USERS:
+        send_message(sock, command_message(USERS))
+    elif name == NICK:
+        if len(args) != 1:
+            show("Usage : /nick <pseudo>", style="red")
+        else:
+            send_message(sock, command_message(NICK, args[0]))
+    else:
+        show(f"Commande inconnue : /{name} — tapez /help", style="red")
+    return True
+
+def ask_username(prompt: str) -> str | None:
+    while True:
+        try:
+            text = input(f"{prompt} : ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not text:
+            continue
+        if not text.startswith("/"):
+            return text
+
+        name, args = parse_command(text)
+        if name == QUIT:
+            return None
+        if name == HELP:
+            show_help()
+        elif name == NICK and len(args) == 1:
+            return args[0]
+        else:
+            show("Ici, tapez un pseudo (ou /help, /quit).", style="red")
+
 def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None:
     for message in messages:
         if message["type"] != SYSTEM:
@@ -54,16 +125,19 @@ def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None
         event = payload["event"]
 
         if event == ASK_USERNAME:
-            try:
-                proposal = input(f"{payload['text']} : ").strip()
-            except (KeyboardInterrupt, EOFError):
+            proposal = ask_username(payload["text"])
+            if proposal is None:
+                show("Déconnecté.", style="yellow")
                 return None
             send_message(sock, command_message(NICK, proposal))
         elif event == WELCOME:
             show(payload["text"], style="green")
+            show("Tapez /help pour la liste des commandes.", style="dim cyan")
             return payload.get("username", "")
         else:
             display(message)
+
+    show("Connexion refusée par le serveur.", style="yellow")
     return None
 
 def receive_messages(messages: Iterator[dict], stop: threading.Event) -> None:
@@ -94,6 +168,10 @@ def send_user_input(sock: socket.socket, stop: threading.Event) -> None:
             text = input().strip()
             if not text:
                 continue
+            if text.startswith("/"):
+                if not run_command(sock, text):
+                    return
+                continue
             if len(text) > MAX_TEXT_LEN:
                 show(
                     f"Message trop long ({len(text)} > {MAX_TEXT_LEN} caractères),"
@@ -122,7 +200,6 @@ def main() -> None:
 
             messages = iter_messages(LineReader(sock), report_invalid)
             if choose_username(sock, messages) is None:
-                console.print("Connexion refusée par le serveur.", style="yellow")
                 return
 
             stop = threading.Event()

@@ -18,8 +18,13 @@ ERROR = "error"
 JOIN = "join"
 LEAVE = "leave"
 NOTICE = "notice"
+RENAME = "rename"
+USER_LIST = "user_list"
 
+HELP = "help"
 NICK = "nick"
+QUIT = "quit"
+USERS = "users"
 
 REQUIRED_FIELDS = {
     CHAT: ("text",),
@@ -41,7 +46,7 @@ def chat_message(text: str, username: str | None = None) -> dict:
     return {"type": CHAT, "payload": payload}
 
 
-def system_message(event: str, text: str, **extra: str) -> dict:
+def system_message(event: str, text: str, **extra: object) -> dict:
     return {"type": SYSTEM, "payload": {"event": event, "text": text, **extra}}
 
 

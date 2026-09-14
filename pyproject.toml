@@ -20,5 +20,10 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "pytest>=8.3.0",
     "ruff>=0.16.4",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

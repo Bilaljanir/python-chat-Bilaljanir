@@ -19,6 +19,10 @@ from protocol import (
     MAX_TEXT_LEN,
     NICK,
     NOTICE,
+    QUIT,
+    RENAME,
+    USER_LIST,
+    USERS,
     WELCOME,
     InvalidMessage,
     LineReader,
@@ -86,10 +90,23 @@ def claim_username(conn: socket.socket, name: str) -> str | None:
     if not NAME_PATTERN.match(name):
         return "Pseudo invalide : 1 à 24 caractères, lettres, chiffres, . _ -"
     with clients_lock:
-        if any(taken.casefold() == name.casefold() for taken in clients.values()):
+        # « sock is not conn » : un renommage ne doit pas buter sur son propre pseudo.
+        if any(
+            sock is not conn and taken.casefold() == name.casefold()
+            for sock, taken in clients.items()
+        ):
             return "Ce pseudo est déjà utilisé, choisissez-en un autre."
         clients[conn] = name
     return None
+
+
+def current_username(conn: socket.socket) -> str:
+    with clients_lock:
+        return clients.get(conn, "")
+
+def connected_usernames() -> list[str]:
+    with clients_lock:
+        return sorted(clients.values(), key=str.casefold)
 
 def invalid_message_logger(
     address: tuple[str, int],
@@ -167,7 +184,7 @@ def handle_client(
                         ),
                         sender=conn,
                     )
-                    relay_messages(conn, username, messages)
+                    relay_messages(conn, messages)
                 if reader.timed_out:
                     send_message(
                         conn,
@@ -185,6 +202,7 @@ def handle_client(
             if username is None:
                 log_safely(f"[red]Rejected:[/] {host}:{port}")
             else:
+                username = current_username(conn) or username
                 release_username(conn)
                 broadcast(
                     system_message(
@@ -196,35 +214,90 @@ def handle_client(
         finally:
             sem.release()
 
-def relay_messages(
-    conn: socket.socket, username: str, messages: Iterator[dict]
-) -> None:
+def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
     for message in messages:
-        relay_one(conn, username, message)
+        # Le pseudo est relu à chaque tour : il change avec /nick, et il disparaît
+        # si un broadcast en échec nous a retirés du registre. Dans ce dernier cas
+        # la session est finie — continuer diffuserait un message sans auteur, et
+        # un /nick ressusciterait la connexion via claim_username().
+        username = current_username(conn)
+        if not username:
+            return
+        if not relay_one(conn, username, message):
+            return
 
 
-def relay_one(conn: socket.socket, username: str, message: dict) -> None:
+def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
     payload = message["payload"]
     if message["type"] == COMMAND:
-        send_message(
-            conn, system_message(ERROR, f"Commande inconnue : {payload['name']}")
-        )
-        return
+        return run_command(conn, payload["name"], payload["args"])
     if message["type"] != CHAT:
         send_message(conn, system_message(ERROR, "Type de message inattendu ici."))
-        return
+        return True
 
     text = payload["text"].strip()
     if not text:
-        return
+        return True
     if len(text) > MAX_TEXT_LEN:
         send_message(
             conn,
             system_message(ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."),
         )
-        return
+        return True
     broadcast(chat_message(text, username=username), sender=conn)
+    return True
 
+
+def run_command(conn: socket.socket, name: str, args: list[str]) -> bool:
+    if name == QUIT:
+        return False
+    if name == USERS:
+        send_message(conn, user_list_message())
+        return True
+    if name == NICK:
+        rename(conn, args[0].strip() if args else "")
+        return True
+    send_message(conn, system_message(ERROR, f"Commande inconnue : {name}"))
+    return True
+
+
+def user_list_message() -> dict:
+    names = connected_usernames()
+    listed = ", ".join(names) if names else "personne"
+    return system_message(
+        USER_LIST, f"Connectés ({len(names)}) : {listed}", users=names
+    )
+
+def rename(conn: socket.socket, new_name: str) -> None:
+    old_name = current_username(conn)
+    if new_name == old_name:
+        send_message(conn, system_message(ERROR, "C'est déjà votre pseudo"))
+        return
+
+    refusal = claim_username(conn, new_name)
+    if refusal is not None:
+        send_message(conn, system_message(ERROR, refusal))
+        return
+
+    log_safely(f"[green]Renamed:[/] {old_name} → {new_name}")
+    send_message(
+        conn,
+        system_message(
+            RENAME,
+            f"Vous êtes désormais {new_name}",
+            username=old_name,
+            new_username=new_name,
+        ),
+    )
+    broadcast(
+        system_message(
+            RENAME,
+            f"{old_name} est désormais {new_name}",
+            username=old_name,
+            new_username=new_name,
+        ),
+        sender=conn,
+    )
 
 def positive_float(value: str) -> float:
     number = float(value)

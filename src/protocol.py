@@ -92,7 +92,6 @@ def _check_payload(message_type: str, payload: dict) -> None:
     if message_type == CHAT:
         _check_optional_text(payload, "username")
     elif message_type == COMMAND:
-        # Normalisé ici pour que le reste du code puisse écrire payload["args"].
         payload["args"] = _checked_args(payload.get("args", []))
 
 

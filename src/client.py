@@ -5,8 +5,7 @@ import socket
 import threading
 from collections.abc import Iterator
 
-from rich.console import Console
-
+import ui
 from protocol import (
     ASK_USERNAME,
     CHAT,
@@ -16,6 +15,7 @@ from protocol import (
     LEAVE,
     MAX_TEXT_LEN,
     NICK,
+    NOTICE,
     QUIT,
     RENAME,
     SYSTEM,
@@ -31,16 +31,16 @@ from protocol import (
     send_message,
 )
 
-console = Console()
-
 SYSTEM_STYLES = {
-    ERROR: "red",
-    JOIN: "cyan",
-    LEAVE: "cyan",
-    RENAME: "cyan",
+    ERROR: "italic red",
+    JOIN: "italic green",
+    LEAVE: "italic yellow",
+    NOTICE: "italic yellow",
+    RENAME: "italic cyan",
     USER_LIST: "cyan",
     WELCOME: "green",
 }
+DEFAULT_SYSTEM_STYLE = "italic yellow"
 
 COMMAND_HELP = {
     HELP: ("/help", "affiche cette aide"),
@@ -50,56 +50,88 @@ COMMAND_HELP = {
 }
 
 
-def show(line: str, style: str | None = None) -> None:
-    console.print(line, style=style, markup=False, highlight=False)
+class Session:
+
+    def __init__(self, username: str) -> None:
+        self._username = username
+        self._lock = threading.Lock()
+
+    @property
+    def username(self) -> str:
+        with self._lock:
+            return self._username
+
+    def rename(self, new_username: str) -> None:
+        with self._lock:
+            self._username = new_username
+
+def show_system(text: str, style: str = DEFAULT_SYSTEM_STYLE) -> None:
+    ui.emit(ui.system_line(text, style))
 
 
 def report_invalid(line: str, error: InvalidMessage) -> None:
-    show(f"[message ignoré : {error}]", style="dim yellow")
+    show_system(f"message ignoré : {error}", style="dim italic yellow")
 
 
-def display(message: dict) -> None:
+def display(message: dict, session: Session) -> None:
     payload = message["payload"]
     if message["type"] == CHAT:
-        show(f"[{payload.get('username', '?')}]: {payload['text']}")
+        ui.emit(ui.chat_line(payload.get("username", "?"), payload["text"]))
     elif message["type"] == SYSTEM:
-        show(payload["text"], style=SYSTEM_STYLES.get(payload["event"], "yellow"))
+        track_rename(payload, session)
+        show_system(
+            payload["text"], SYSTEM_STYLES.get(payload["event"], DEFAULT_SYSTEM_STYLE)
+        )
+
+
+def track_rename(payload: dict, session: Session) -> None:
+
+    if payload["event"] != RENAME or payload.get("username") != session.username:
+        return
+    new_username = payload.get("new_username")
+    if new_username:
+        session.rename(new_username)
+
+
+def show_help() -> None:
+    ui.emit(
+        ui.help_panel(
+            "Commandes",
+            list(COMMAND_HELP.values()),
+            "toute autre ligne est envoyée comme message",
+        )
+    )
+
 
 def parse_command(text: str) -> tuple[str, list[str]]:
     name, _, rest = text[1:].partition(" ")
     return name.casefold(), rest.split()
 
 
-def show_help() -> None:
-    show("Commandes disponibles :", style="cyan")
-    for usage, description in COMMAND_HELP.values():
-        show(f"  {usage:<16}{description}", style="cyan")
-    show("  toute autre ligne est envoyée comme message", style="dim cyan")
-
-
-def run_command(sock: socket.socket, text: str) -> bool:
+def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
     name, args = parse_command(text)
     if name == HELP:
         show_help()
     elif name == QUIT:
+        stop.set()
         send_message(sock, command_message(QUIT))
-        show("Déconnecté.", style="yellow")
+        show_system("Déconnecté.", style="italic yellow")
         return False
     elif name == USERS:
         send_message(sock, command_message(USERS))
     elif name == NICK:
         if len(args) != 1:
-            show("Usage : /nick <pseudo>", style="red")
+            show_system("Usage : /nick <pseudo>", style="italic red")
         else:
             send_message(sock, command_message(NICK, args[0]))
     else:
-        show(f"Commande inconnue : /{name} — tapez /help", style="red")
+        show_system(f"Commande inconnue : /{name} — tapez /help", style="italic red")
     return True
 
 def ask_username(prompt: str) -> str | None:
     while True:
         try:
-            text = input(f"{prompt} : ").strip()
+            text = ui.read_line(f"{prompt} {ui.input_prompt()}").strip()
         except (KeyboardInterrupt, EOFError):
             return None
         if not text:
@@ -115,7 +147,7 @@ def ask_username(prompt: str) -> str | None:
         elif name == NICK and len(args) == 1:
             return args[0]
         else:
-            show("Ici, tapez un pseudo (ou /help, /quit).", style="red")
+            show_system("Ici, tapez un pseudo (ou /help, /quit).", style="italic red")
 
 def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None:
     for message in messages:
@@ -127,33 +159,36 @@ def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None
         if event == ASK_USERNAME:
             proposal = ask_username(payload["text"])
             if proposal is None:
-                show("Déconnecté.", style="yellow")
+                show_system("Déconnecté.", style="italic yellow")
                 return None
             send_message(sock, command_message(NICK, proposal))
         elif event == WELCOME:
-            show(payload["text"], style="green")
-            show("Tapez /help pour la liste des commandes.", style="dim cyan")
+            ui.emit(ui.banner(payload["text"]))
+            show_system("Tapez /help pour la liste des commandes.", style="dim italic cyan")
             return payload.get("username", "")
         else:
-            display(message)
+            show_system(payload["text"], SYSTEM_STYLES.get(event, DEFAULT_SYSTEM_STYLE))
 
-    show("Connexion refusée par le serveur.", style="yellow")
+    show_system("Connexion refusée par le serveur.", style="italic yellow")
     return None
 
-def receive_messages(messages: Iterator[dict], stop: threading.Event) -> None:
+def receive_messages(
+    messages: Iterator[dict], stop: threading.Event, session: Session
+) -> None:
     try:
         for message in messages:
             if stop.is_set():
                 return
-            display(message)
+            display(message, session)
     except (OSError, MessageTooLong):
         pass
 
     if stop.is_set():
         return
-    console.print("Connexion fermée par le serveur", style="yellow")
     stop.set()
-    interrupt_input()
+    show_system("Connexion fermée par le serveur", style="italic yellow")
+    if ui.awaiting_input():
+        interrupt_input()
 
 def interrupt_input() -> None:
     try:
@@ -162,28 +197,33 @@ def interrupt_input() -> None:
         os._exit(0)
 
 
-def send_user_input(sock: socket.socket, stop: threading.Event) -> None:
+def send_user_input(
+    sock: socket.socket, stop: threading.Event, session: Session
+) -> None:
     try:
         while not stop.is_set():
-            text = input().strip()
+            text = ui.read_line().strip()
             if not text:
                 continue
             if text.startswith("/"):
-                if not run_command(sock, text):
+                if not run_command(sock, text, stop):
                     return
                 continue
             if len(text) > MAX_TEXT_LEN:
-                show(
+                show_system(
                     f"Message trop long ({len(text)} > {MAX_TEXT_LEN} caractères),"
                     " rien n'a été envoyé.",
-                    style="red",
+                    style="italic red",
                 )
                 continue
             send_message(sock, chat_message(text))
+            ui.emit(ui.chat_line(session.username, text, mine=True))
     except (KeyboardInterrupt, EOFError):
-        console.print("\nDéconnecté.", style="yellow")
+        if not stop.is_set():
+            ui.emit(ui.system_line("Déconnecté.", "italic yellow"))
     finally:
         stop.set()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TCP chat client")
@@ -196,21 +236,29 @@ def main() -> None:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.connect((args.host, args.port))
-            console.print(f"Connecté à {args.host}:{args.port}", style="green")
+            show_system(f"Connecté à {args.host}:{args.port}", style="italic green")
 
             messages = iter_messages(LineReader(sock), report_invalid)
-            if choose_username(sock, messages) is None:
+            username = choose_username(sock, messages)
+            if username is None:
                 return
+
+            session = Session(username)
+            ui.separator("conversation")
 
             stop = threading.Event()
             threading.Thread(
-                target=receive_messages, args=(messages, stop), daemon=True
+                target=receive_messages,
+                args=(messages, stop, session),
+                daemon=True,
             ).start()
-            send_user_input(sock, stop)
+            send_user_input(sock, stop, session)
+    except KeyboardInterrupt:
+        pass
     except OSError as e:
-        console.print(f"Connexion impossible : {e}", style="red")
+        show_system(f"Connexion impossible : {e}", style="italic red")
     except MessageTooLong as e:
-        console.print(f"Le serveur a envoyé une ligne trop longue : {e}", style="red")
+        show_system(f"Le serveur a envoyé une ligne trop longue : {e}", style="italic red")
 
 if __name__ == "__main__":
     main()

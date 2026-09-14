@@ -216,11 +216,18 @@ def handle_client(
 
 def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
     for message in messages:
-        if not relay_one(conn, message):
+        # Le pseudo est relu à chaque tour : il change avec /nick, et il disparaît
+        # si un broadcast en échec nous a retirés du registre. Dans ce dernier cas
+        # la session est finie — continuer diffuserait un message sans auteur, et
+        # un /nick ressusciterait la connexion via claim_username().
+        username = current_username(conn)
+        if not username:
+            return
+        if not relay_one(conn, username, message):
             return
 
 
-def relay_one(conn: socket.socket, message: dict) -> bool:
+def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
     payload = message["payload"]
     if message["type"] == COMMAND:
         return run_command(conn, payload["name"], payload["args"])
@@ -237,7 +244,7 @@ def relay_one(conn: socket.socket, message: dict) -> bool:
             system_message(ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."),
         )
         return True
-    broadcast(chat_message(text, username=current_username(conn)), sender=conn)
+    broadcast(chat_message(text, username=username), sender=conn)
     return True
 
 

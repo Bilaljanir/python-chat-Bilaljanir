@@ -1,5 +1,3 @@
-"""Le découpage des commandes côté client, et ce qui part sur le réseau."""
-
 import json
 import threading
 
@@ -11,7 +9,6 @@ from protocol import HELP, NICK, QUIT, USERS
 
 
 class FakeSocket:
-    """Retient ce que le client a envoyé, pour vérifier ce qui part — ou pas."""
 
     def __init__(self) -> None:
         self.sent: list[dict] = []

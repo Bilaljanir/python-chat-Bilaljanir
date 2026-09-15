@@ -17,7 +17,7 @@ $ uv run python src/client.py            # terminal 3  -> pseudo : bob
 ## Sommaire
 
 1. [Démarrage](#1-démarrage)
-2. [Les trois fichiers](#2-les-trois-fichiers)
+2. [Les fichiers](#2-les-fichiers)
 3. [Le protocole](#3-le-protocole)
 4. [Pourquoi `LineReader` existe](#4-pourquoi-linereader-existe)
 5. [Le serveur](#5-le-serveur)
@@ -25,8 +25,9 @@ $ uv run python src/client.py            # terminal 3  -> pseudo : bob
 7. [La concurrence, en détail](#7-la-concurrence-en-détail)
 8. [Les pièges rencontrés](#8-les-pièges-rencontrés-et-leurs-corrections)
 9. [Paramètres](#9-paramètres)
-10. [Tester](#10-tester)
-11. [Par où commencer la lecture](#11-par-où-commencer-la-lecture)
+10. [Administration et journal](#10-administration-et-journal)
+11. [Tester](#11-tester)
+12. [Par où commencer la lecture](#12-par-où-commencer-la-lecture)
 
 ---
 
@@ -44,14 +45,21 @@ Les lignes commençant par `/` sont des commandes : `/help`, `/users`,
 
 ---
 
-## 2. Les trois fichiers
+## 2. Les fichiers
 
 ```
 src/
 ├── protocol.py   ce qui est commun aux deux bouts : format des messages, lecture du flux
 ├── server.py     accepte les connexions, tient le registre des pseudos, diffuse
-└── client.py     demande le pseudo, envoie ce qu'on tape, affiche ce qui arrive
+├── client.py     demande le pseudo, envoie ce qu'on tape, affiche ce qui arrive
+├── ui.py         la présentation côté client : couleurs, panneaux, invite redessinée
+└── admin.py      la présentation côté serveur : journal, tableau de bord, niveaux
 ```
+
+Les trois premiers portent la logique ; les deux derniers ne portent que
+l'affichage. Le partage est le même des deux côtés : **un module décide *quoi*
+dire, un autre décide *comment* ça se voit.** `server.py` ne sait pas dessiner,
+il journalise ; `admin.py` ne sait rien du registre, il reçoit un état déjà figé.
 
 La règle de partage est simple : **tout ce que le serveur et le client doivent
 comprendre de la même façon vit dans `protocol.py`.** Si les deux côtés
@@ -480,6 +488,8 @@ la forme actuelle du code.
 | `-p, --port` | 12345 | port d'écoute |
 | `-m, --max-clients` | 50 | connexions simultanées ; au-delà, l'`accept` attend |
 | `-t, --idle-timeout` | 300 | secondes de silence avant déconnexion |
+| `-l, --log-file` | `server.log` | fichier où le journal est ajouté |
+| `--no-dashboard` | — | journal déroulant au lieu du tableau de bord |
 
 `--max-clients` et `--idle-timeout` refusent zéro, les valeurs négatives et
 `inf` : une valeur absurde ne doit pas se transformer en panne à l'exécution.
@@ -493,6 +503,9 @@ la forme actuelle du code.
 | `RECV_SIZE` | 1024 | `protocol.py` | taille d'un bloc lu |
 | `MAX_NAME_ATTEMPTS` | 3 | `server.py` | essais de pseudo avant fermeture |
 | `NAME_PATTERN` | `^[\w.-]{1,24}$` | `server.py` | pseudos acceptés |
+| `ACCEPT_TIMEOUT` | 0.5 | `server.py` | secondes avant que la boucle d'accueil relise `stop` |
+| `ACTIVITY_LINES` | 12 | `admin.py` | lignes de journal gardées en mémoire |
+| `REFRESH_DELAY` | 0.5 | `admin.py` | secondes entre deux redessins |
 
 Les pseudos sont comparés **sans tenir compte de la casse** : `alice` et
 `ALICE` ne peuvent pas coexister, car deux pseudos qui se lisent pareil ne
@@ -500,7 +513,123 @@ permettraient pas d'identifier qui parle.
 
 ---
 
-## 10. Tester
+## 10. Administration et journal
+
+Le serveur tourne sans personne devant lui. Deux besoins en découlent : voir
+d'un coup d'œil ce qui se passe *maintenant*, et pouvoir relire *après coup* ce
+qui s'est passé. Ce sont deux vues d'une même source — le journal.
+
+### Le serveur journalise, il n'affiche pas
+
+`server.py` n'appelle plus `console.log`. Il appelle `logger.info(...)`, et
+c'est `admin.py` qui décide où cela va :
+
+```python
+logger.info("Connexion : %s (%s:%s)", username, host, port)
+```
+
+Les arguments sont passés à `logging`, pas interpolés dans une f-string : une
+ligne de niveau `DEBUG` ne coûte rien tant que ce niveau n'est pas activé.
+`setup_logging()` branche trois destinations :
+
+| Destination | Rôle |
+|---|---|
+| `logging.FileHandler` | `server.log`, en ajout, encodé en UTF-8 |
+| `rich.logging.RichHandler` | le terminal, en couleurs |
+| `admin.ActivityLog` | un `deque` borné, relu par le tableau de bord |
+
+`ActivityLog` est un handler comme les deux autres : rien n'est journalisé
+deux fois, et le tampon ne grandit pas avec la durée de vie du serveur.
+
+`RichHandler` est configuré avec **`markup=False`**. Les pseudos viennent du
+réseau : un pseudo écrit `[red]` ne doit pas piloter les couleurs du terminal
+de l'administrateur.
+
+### Le tableau de bord
+
+Par défaut, un `rich.live.Live` occupe le bas du terminal et se redessine deux
+fois par seconde :
+
+```
+╭─ Serveur de chat ────────────────────────────────╮
+│  Écoute      0.0.0.0:12345                       │
+│  Clients     2 / 50                              │
+│  En ligne    00:04:12                            │
+│  Connectés   alice, bob                          │
+╰──────────────────────────────────────────────────╯
+╭─ Activité récente ───────────────────────────────╮
+│  09:12:01  INFO      Connexion : alice           │
+│  09:12:07  INFO      Connexion : bob             │
+│  09:12:19  WARNING   Message invalide de …       │
+╰──────────────────────────────────────────────────╯
+```
+
+`admin.dashboard()` reçoit une liste de pseudos et une liste de lignes — pas le
+registre, pas le handler. Elle ne prend donc aucun verrou et se teste sans
+serveur : on lui donne un état, on lit ce qu'elle dessine.
+
+C'est `dashboard_snapshot()`, côté serveur, qui fige cet état à chaque redessin.
+
+Tant que le tableau de bord est affiché, le `RichHandler` du terminal est
+remonté à `WARNING`. Ce n'est pas seulement pour éviter de tout écrire deux
+fois : le panneau d'activité ne garde que `ACTIVITY_LINES` lignes et les perd
+en défilant, alors qu'un `WARNING` imprimé au-dessus du tableau de bord reste
+dans l'historique du terminal. Les deux vues sont donc complémentaires — le
+courant passe dans le panneau, ce qui compte s'inscrit dans le défilement.
+
+Le tableau de bord s'efface tout seul quand la sortie n'est pas un terminal
+(un `| tee`, un service, pytest) : on retombe alors sur le journal déroulant,
+comme avec `--no-dashboard`.
+
+### L'arrêt : prévenir avant de fermer
+
+Couper le serveur sans rien dire laisse chaque client face à une socket morte.
+`shutdown_clients()` fait l'inverse : il vide le registre, envoie un `notice` à
+tout le monde, puis ferme.
+
+```
+$ uv run python src/server.py
+^C
+# côté client : « Le serveur s'arrête, à bientôt. »
+#               « Connexion fermée par le serveur »
+```
+
+Vider le registre **d'abord** n'est pas cosmétique : un thread client qui était
+en train de relayer un message voit son pseudo disparaître et s'arrête de
+lui-même (`relay_messages` le vérifie à chaque tour), au lieu de diffuser dans
+un serveur en train de fermer. Sans cela, chaque thread annoncerait en partant
+un `leave` à tous les autres — *n* départs diffusés *n* fois, dans un serveur
+qui ferme.
+
+Tout part d'un seul drapeau, `stop`, posé par `install_stop_handlers()` :
+
+```python
+for signum in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(signum, request_stop)
+```
+
+Attendre un `KeyboardInterrupt` n'aurait couvert que `SIGINT`. Un `docker stop`
+ou un `systemctl stop` envoie `SIGTERM` : sans gestionnaire, le processus meurt
+sur-le-champ et personne n'est prévenu — précisément le cas où l'arrêt propre
+sert le plus. Le gestionnaire se retire dès le premier signal, si bien qu'un
+second `Ctrl-C` retombe sur le comportement par défaut et tue le serveur, si
+l'arrêt devait s'éterniser.
+
+Un gestionnaire de signal s'exécute toujours dans le thread principal. C'est
+pourquoi `main()` a été retourné : `serve()` part dans un thread, et le thread
+principal reste disponible — il dessine le tableau de bord, ou bloque sur
+`stop.wait()`. Dans les deux cas, poser `stop` le réveille.
+
+`serve()` lit ce même drapeau, mais **en tête de boucle**, pas au fond d'un
+`except`. C'est ce que permet le `settimeout(ACCEPT_TIMEOUT)` sur la socket
+d'écoute : `accept()` rend la main toutes les demi-secondes, la boucle relit
+`stop` et sort d'elle-même. Sans ce délai, il aurait fallu fermer la socket
+sous un `accept()` bloqué dans un autre thread, puis deviner, depuis
+l'`OSError` qui en sort, s'il s'agissait d'un arrêt ou d'une panne.
+
+---
+
+## 11. Tester
 
 ### À la main
 
@@ -515,6 +644,9 @@ Un serveur, deux clients, et on vérifie :
 | il tape `a b` | `Pseudo invalide : ...` |
 | 3 refus d'affilée | connexion fermée |
 | `Ctrl-C` sur bob | alice voit `bob a quitté le chat` |
+| `Ctrl-C` sur le serveur | les clients voient `Le serveur s'arrête, à bientôt.`, puis la fermeture |
+| `kill <pid>` du serveur (`SIGTERM`) | même chose : l'arrêt propre ne dépend pas du clavier |
+| après coup | `server.log` contient les connexions, départs et refus |
 
 Puis les commandes :
 
@@ -549,7 +681,7 @@ C'est aussi le moyen de vérifier le traitement des messages invalides : tapez
 
 ---
 
-## 11. Par où commencer la lecture
+## 12. Par où commencer la lecture
 
 Dans cet ordre, chaque fichier s'appuie sur le précédent :
 
@@ -560,6 +692,7 @@ Dans cet ordre, chaque fichier s'appuie sur le précédent :
 3. **`server.py`, `broadcast()` et `claim_username()`** — les deux endroits où
    les threads se rencontrent, donc les deux endroits où le verrou compte.
 4. **`client.py`, `main()`** — connexion, pseudo, puis les deux threads.
+5. **`admin.py`** — pour finir : ce que tout cela donne à voir, et rien d'autre.
 
 La question à se poser devant chaque ligne du serveur : *combien de threads
 peuvent exécuter ceci en même temps, et sur quelles données ?*

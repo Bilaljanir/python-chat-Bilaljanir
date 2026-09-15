@@ -1,10 +1,3 @@
-"""Un vrai serveur sur un port éphémère, et des clients qui parlent le protocole.
-
-Les tests d'intégration ne simulent rien : ils ouvrent des sockets vers le
-serveur du dépôt, exactement comme le ferait `nc`. C'est la seule façon de
-couvrir un protocole dont l'état vit dans un registre partagé entre threads.
-"""
-
 import json
 import socket
 import threading
@@ -21,12 +14,10 @@ RECV_TIMEOUT = 3
 
 @pytest.fixture(autouse=True)
 def quiet_ui(monkeypatch):
-    """Le client écrit dans le terminal : pas dans la sortie de pytest."""
     monkeypatch.setattr(ui, "console", Console(quiet=True))
 
 
 class FakeClient:
-    """Un pair minimal : envoie des lignes JSON, en lit une à la fois."""
 
     def __init__(self, port: int) -> None:
         self._sock = socket.create_connection(("localhost", port))
@@ -45,7 +36,6 @@ class FakeClient:
         self.send_raw(json.dumps({"type": "chat", "payload": {"text": text}}))
 
     def receive(self) -> dict | None:
-        """Le prochain message, ou None si le serveur a fermé la connexion."""
         while "\n" not in self._buffer:
             try:
                 data = self._sock.recv(4096)
@@ -58,7 +48,6 @@ class FakeClient:
         return json.loads(line)
 
     def drain(self, timeout: float = 0.3) -> list[dict]:
-        """Tout ce qui est déjà arrivé, sans attendre la suite."""
         received = []
         self._sock.settimeout(timeout)
         try:
@@ -73,7 +62,6 @@ class FakeClient:
         return received
 
     def login(self, username: str) -> dict:
-        """Poignée de main complète : renvoie le message `welcome`."""
         self.receive()  # ask_username
         self.command("nick", username)
         return self.receive()
@@ -84,8 +72,6 @@ class FakeClient:
 
 @pytest.fixture
 def chat_server():
-    """Démarre `serve()` sur un port libre, et rend le registre vierge après coup."""
-    # Les logs du serveur n'ont rien à faire dans la sortie de pytest.
     server_module.console = Console(quiet=True)
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -104,7 +90,6 @@ def chat_server():
 
 @pytest.fixture
 def connect(chat_server):
-    """Ouvre des clients et les referme tous à la fin du test."""
     opened: list[FakeClient] = []
 
     def _connect(username: str | None = None) -> FakeClient:

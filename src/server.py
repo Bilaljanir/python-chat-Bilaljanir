@@ -1,7 +1,6 @@
 import argparse
 import logging
 import math
-import re
 import signal
 import socket
 import threading
@@ -11,6 +10,7 @@ from collections.abc import Callable, Iterator
 from rich.console import Console, RenderableType
 
 import admin
+import registry
 from protocol import (
     ASK_USERNAME,
     CHAT,
@@ -45,20 +45,10 @@ MAX_NAME_ATTEMPTS = 3
 RETRY_DELAY = 0.1
 ACCEPT_TIMEOUT = 0.5
 LOG_EXCERPT_LEN = 120
-NAME_PATTERN = re.compile(r"^[\w.-]{1,24}$")
 SHUTDOWN_NOTICE = "Le serveur s'arrête, à bientôt."
 
-clients: dict[socket.socket, str] = {}
-clients_lock = threading.Lock()
-
-
-def release_username(sock: socket.socket) -> None:
-    with clients_lock:
-        clients.pop(sock, None)
-
-
 def drop_client(sock: socket.socket) -> None:
-    release_username(sock)
+    registry.release(sock)
     try:
         sock.shutdown(socket.SHUT_RDWR)
     except OSError:
@@ -66,10 +56,7 @@ def drop_client(sock: socket.socket) -> None:
 
 
 def shutdown_clients() -> int:
-    with clients_lock:
-        socks = list(clients)
-        clients.clear()
-
+    socks = registry.drain()
     data = f"{encode(system_message(NOTICE, SHUTDOWN_NOTICE))}\n".encode()
     warned = sum(try_send(sock, data) for sock in socks)
     for sock in socks:
@@ -78,10 +65,9 @@ def shutdown_clients() -> int:
 
 def broadcast(message: dict, sender: socket.socket | None = None) -> None:
     data = f"{encode(message)}\n".encode()
-    with clients_lock:
-        targets = [sock for sock in clients if sock is not sender]
-
-    unreachable = [sock for sock in targets if not try_send(sock, data)]
+    unreachable = [
+        sock for sock in registry.targets(exclude=sender) if not try_send(sock, data)
+    ]
     for sock in unreachable:
         drop_client(sock)
 
@@ -91,27 +77,6 @@ def try_send(sock: socket.socket, data: bytes) -> bool:
     except OSError:
         return False
     return True
-
-def claim_username(conn: socket.socket, name: str) -> str | None:
-
-    if not NAME_PATTERN.match(name):
-        return "Pseudo invalide : 1 à 24 caractères, lettres, chiffres, . _ -"
-    with clients_lock:
-        if any(
-            sock is not conn and taken.casefold() == name.casefold()
-            for sock, taken in clients.items()
-        ):
-            return "Ce pseudo est déjà utilisé, choisissez-en un autre."
-        clients[conn] = name
-    return None
-
-def current_username(conn: socket.socket) -> str:
-    with clients_lock:
-        return clients.get(conn, "")
-
-def connected_usernames() -> list[str]:
-    with clients_lock:
-        return sorted(clients.values(), key=str.casefold)
 
 def invalid_message_logger(
     address: tuple[str, int],
@@ -145,7 +110,7 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
             )
             continue
 
-        refusal = claim_username(conn, name)
+        refusal = registry.claim(conn, name)
         if refusal is None:
             try:
                 send_message(
@@ -155,7 +120,7 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
                     ),
                 )
             except OSError:
-                release_username(conn)
+                registry.release(conn)
                 raise
             return name
         send_message(conn, system_message(ERROR, refusal))
@@ -211,8 +176,8 @@ def handle_client(
             if username is None:
                 logger.info("Connexion refusée : %s:%s", host, port)
             else:
-                username = current_username(conn) or username
-                release_username(conn)
+                username = registry.current(conn) or username
+                registry.release(conn)
                 broadcast(
                     system_message(
                         LEAVE, f"{username} a quitté le chat", username=username
@@ -225,7 +190,7 @@ def handle_client(
 
 def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
     for message in messages:
-        username = current_username(conn)
+        username = registry.current(conn)
         if not username:
             return
         if not relay_one(conn, username, message):
@@ -266,19 +231,19 @@ def run_command(conn: socket.socket, name: str, args: list[str]) -> bool:
 
 
 def user_list_message() -> dict:
-    names = connected_usernames()
+    names = registry.usernames()
     listed = ", ".join(names) if names else "personne"
     return system_message(
         USER_LIST, f"Connectés ({len(names)}) : {listed}", users=names
     )
 
 def rename(conn: socket.socket, new_name: str) -> None:
-    old_name = current_username(conn)
+    old_name = registry.current(conn)
     if new_name == old_name:
         send_message(conn, system_message(ERROR, "C'est déjà votre pseudo"))
         return
 
-    refusal = claim_username(conn, new_name)
+    refusal = registry.claim(conn, new_name)
     if refusal is not None:
         send_message(conn, system_message(ERROR, refusal))
         return
@@ -406,7 +371,7 @@ def dashboard_snapshot(
     def snapshot() -> RenderableType:
         return admin.dashboard(
             address,
-            connected_usernames(),
+            registry.usernames(),
             max_clients,
             time.monotonic() - started,
             activity.lines(),

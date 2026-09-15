@@ -93,7 +93,7 @@ def help_panel(title: str, rows: list[tuple[str, str]], footer: str) -> Panel:
         table.add_row(usage, description)
     table.add_row("", Text(footer, style="dim italic"))
     return Panel(table, title=title, border_style="cyan", title_align="left")
-    1
+
 
 def banner(text: str, style: str = "green") -> Panel:
     return Panel(Text(text, style=style), border_style=style, expand=False)

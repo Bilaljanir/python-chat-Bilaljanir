@@ -50,13 +50,18 @@ Les lignes commençant par `/` sont des commandes : `/help`, `/users`,
 ```
 src/
 ├── protocol.py   ce qui est commun aux deux bouts : format des messages, lecture du flux
-├── server.py     accepte les connexions, tient le registre des pseudos, diffuse
+├── server.py     accepte les connexions, relaie les messages, diffuse
+├── registry.py   qui est connecté, sous quel pseudo — le seul état partagé
 ├── client.py     demande le pseudo, envoie ce qu'on tape, affiche ce qui arrive
 ├── ui.py         la présentation côté client : couleurs, panneaux, invite redessinée
 └── admin.py      la présentation côté serveur : journal, tableau de bord, niveaux
 ```
 
-Les trois premiers portent la logique ; les deux derniers ne portent que
+`registry.py` ne connaît ni le protocole ni les sockets au-delà de leur rôle de
+clé : il ne sait que *qui est là*. C'est le seul état partagé entre threads, et
+le regrouper dans un module met tous les verrous du projet au même endroit.
+
+Les quatre premiers portent la logique ; les deux derniers ne portent que
 l'affichage. Le partage est le même des deux côtés : **un module décide *quoi*
 dire, un autre décide *comment* ça se voit.** `server.py` ne sait pas dessiner,
 il journalise ; `admin.py` ne sait rien du registre, il reçoit un état déjà figé.
@@ -145,7 +150,7 @@ client                                              serveur
   |--------------- connexion TCP --------------------->|  thread créé
   |<-- {"type":"system","payload":{"event":"ask_username","text":"Choisissez un pseudo"}}
   |--> {"type":"command","payload":{"name":"nick","args":["alice"]}}
-  |                                                    |  claim_username() -> libre
+  |                                                    |  registry.claim() -> libre
   |<-- {"type":"system","payload":{"event":"welcome","username":"alice",...}}
   |                                                    |  broadcast -> les autres
   |                                                    |    system / join / alice
@@ -271,9 +276,11 @@ chemin de sortie** — c'est pour ça qu'il est placé tout à la fin de
 
 ### Le registre
 
+Il vit dans `registry.py`, à lui seul :
+
 ```python
 clients: dict[socket.socket, str] = {}   # socket -> pseudo
-clients_lock = threading.Lock()
+_lock = threading.Lock()
 ```
 
 Un dictionnaire, parce qu'il répond aux deux questions du chat : *à qui dois-je
@@ -282,13 +289,13 @@ aussi aux deux commandes ajoutées ensuite : `/users` lit ses valeurs, `/nick`
 en remplace une.
 
 Depuis `/nick`, **le pseudo n'est plus une variable de `handle_client`** : il
-est relu dans le registre à chaque message relayé (`current_username(conn)`).
+est relu dans le registre à chaque message relayé (`registry.current(conn)`).
 Une variable locale aurait continué à attribuer les messages à l'ancien nom, et
 le `leave` de fin de session aurait annoncé le départ de quelqu'un qui n'existe
 plus.
 
-`claim_username` sert les deux cas — poignée de main et renommage — grâce à une
-condition unique :
+`registry.claim()` sert les deux cas — poignée de main et renommage — grâce à
+une condition unique :
 
 ```python
 if any(sock is not conn and taken.casefold() == name.casefold()
@@ -299,14 +306,19 @@ Le `sock is not conn` est ce qui permet à `alice` de devenir `ALICE` : on
 ignore sa propre entrée dans le test d'unicité, sans quoi tout renommage
 buterait sur son propre pseudo.
 
+Le reste du serveur ne touche jamais au dictionnaire : il passe par `claim`,
+`release`, `current`, `usernames`, `targets` et `drain`. Chacune prend le
+verrou et le rend avant de revenir — aucun appelant n'a donc à savoir qu'il
+existe.
+
 ### La diffusion
 
 ```python
 def broadcast(message, sender=None):
     data = f"{encode(message)}\n".encode()   # sérialisé une fois pour tous
-    with clients_lock:
-        targets = [sock for sock in clients if sock is not sender]   # copie
-    unreachable = [sock for sock in targets if not try_send(sock, data)]
+    unreachable = [                          # registry.targets() rend une copie
+        sock for sock in registry.targets(exclude=sender) if not try_send(sock, data)
+    ]
     for sock in unreachable:
         drop_client(sock)
 ```
@@ -416,18 +428,22 @@ main.
 
 ## 7. La concurrence, en détail
 
-Tout ce qui suit est partagé entre threads, donc protégé par `clients_lock` :
+Tout ce qui est partagé entre threads vit dans `registry.py`, et **rien n'y est
+lu ni écrit hors de son verrou** :
 
 | Ce qui est protégé | Où | Pourquoi |
 |---|---|---|
-| lire la liste des destinataires | `broadcast` | un dict ne doit pas changer de taille pendant qu'on l'itère |
-| vérifier l'unicité **et** insérer | `claim_username` | voir ci-dessous |
-| retirer un client | `drop_client`, fin de `handle_client` | même raison |
+| lire la liste des destinataires | `registry.targets` | un dict ne doit pas changer de taille pendant qu'on l'itère |
+| vérifier l'unicité **et** insérer | `registry.claim` | voir ci-dessous |
+| retirer un client | `registry.release`, `registry.drain` | même raison |
+
+Le verrou est privé (`_lock`) : aucun appelant ne peut l'oublier, puisqu'aucun
+appelant ne le voit.
 
 ### Le point crucial : unicité et insertion sous le même verrou
 
 ```python
-with clients_lock:
+with _lock:
     if any(taken.casefold() == name.casefold() for taken in clients.values()):
         return "Ce pseudo est déjà utilisé, choisissez-en un autre."
     clients[conn] = name          # dans le MÊME bloc with
@@ -502,7 +518,7 @@ la forme actuelle du code.
 | `MAX_TEXT_LEN` | 1024 | `protocol.py` | longueur maximale d'un texte de chat |
 | `RECV_SIZE` | 1024 | `protocol.py` | taille d'un bloc lu |
 | `MAX_NAME_ATTEMPTS` | 3 | `server.py` | essais de pseudo avant fermeture |
-| `NAME_PATTERN` | `^[\w.-]{1,24}$` | `server.py` | pseudos acceptés |
+| `NAME_PATTERN` | `^[\w.-]{1,24}$` | `registry.py` | pseudos acceptés |
 | `ACCEPT_TIMEOUT` | 0.5 | `server.py` | secondes avant que la boucle d'accueil relise `stop` |
 | `ACTIVITY_LINES` | 12 | `admin.py` | lignes de journal gardées en mémoire |
 | `REFRESH_DELAY` | 0.5 | `admin.py` | secondes entre deux redessins |
@@ -689,8 +705,9 @@ Dans cet ordre, chaque fichier s'appuie sur le précédent :
    compris que TCP ne découpe pas les messages, le reste coule de source.
 2. **`server.py`, `handle_client()`** — la vie d'un client de bout en bout ;
    les autres fonctions du serveur ne sont que ses étapes détaillées.
-3. **`server.py`, `broadcast()` et `claim_username()`** — les deux endroits où
-   les threads se rencontrent, donc les deux endroits où le verrou compte.
+3. **`registry.py`, puis `broadcast()`** — tout l'état partagé tient dans le
+   premier ; le second est ce qui le lit le plus souvent. C'est là que le
+   verrou compte.
 4. **`client.py`, `main()`** — connexion, pseudo, puis les deux threads.
 5. **`admin.py`** — pour finir : ce que tout cela donne à voir, et rien d'autre.
 

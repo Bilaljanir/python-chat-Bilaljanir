@@ -331,6 +331,8 @@ def serve(
         conn = None
         started = False
         try:
+            if stop.is_set():
+                break
             conn, address = server_socket.accept()
             threading.Thread(
                 target=handle_client,

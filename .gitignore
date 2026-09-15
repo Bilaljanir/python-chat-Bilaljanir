@@ -8,3 +8,6 @@ __pycache__/
 
 # IDE
 .idea/
+
+# Journal du serveur
+*.log

@@ -123,7 +123,7 @@ class InvalidMessageGuard:
         )
         if self.count >= self._limit:
             raise TooManyInvalidMessages(f"{self.count} messages invalides")
-        send_message(self._conn, system_message(ERROR, f"Message ignoré : {error}"))
+        warn_client(self._conn, f"Message ignoré : {error}")
 
 def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | None:
 

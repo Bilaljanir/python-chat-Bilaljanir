@@ -1,19 +1,5 @@
 # python-chat
 
-Un chat de groupe en TCP : un serveur, plusieurs clients dans un terminal.
-Les deux bouts parlent un protocole **JSON délimité par des sauts de ligne**
-(voir [Le protocole](#3-le-protocole)). Écrit avec la bibliothèque standard
-uniquement (`socket`, `threading`, `json`), plus
-[rich](https://rich.readthedocs.io/) pour l'affichage.
-
-```
-$ uv run python src/server.py            # terminal 1
-$ uv run python src/client.py            # terminal 2  -> pseudo : alice
-$ uv run python src/client.py            # terminal 3  -> pseudo : bob
-```
-
----
-
 ## Sommaire
 
 1. [Démarrage](#1-démarrage)

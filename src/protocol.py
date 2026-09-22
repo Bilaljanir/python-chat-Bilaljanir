@@ -15,6 +15,7 @@ KEEPALIVE_COUNT = 3
 CHAT = "chat"
 SYSTEM = "system"
 COMMAND = "command"
+PRIVATE = "private"
 
 ASK_USERNAME = "ask_username"
 WELCOME = "welcome"
@@ -26,6 +27,7 @@ RENAME = "rename"
 USER_LIST = "user_list"
 
 HELP = "help"
+MSG = "msg"
 NICK = "nick"
 QUIT = "quit"
 USERS = "users"
@@ -34,6 +36,7 @@ REQUIRED_FIELDS = {
     CHAT: ("text",),
     SYSTEM: ("event", "text"),
     COMMAND: ("name",),
+    PRIVATE: ("text", "to"),
 }
 
 
@@ -53,6 +56,12 @@ def chat_message(text: str, username: str | None = None) -> dict:
 def system_message(event: str, text: str, **extra: object) -> dict:
     return {"type": SYSTEM, "payload": {"event": event, "text": text, **extra}}
 
+
+def private_message(text: str, to: str, username: str | None = None) -> dict:
+    payload = {"text": text, "to": to}
+    if username is not None:
+        payload["username"] = username
+    return {"type": PRIVATE, "payload": payload}
 
 def command_message(name: str, *args: str) -> dict:
     return {"type": COMMAND, "payload": {"name": name, "args": list(args)}}
@@ -93,7 +102,7 @@ def _check_payload(message_type: str, payload: dict) -> None:
                 f"champ « {field} » absent ou non textuel dans un message {message_type}"
             )
 
-    if message_type == CHAT:
+    if message_type in (CHAT, PRIVATE):
         _check_optional_text(payload, "username")
     elif message_type == COMMAND:
         payload["args"] = _checked_args(payload.get("args", []))

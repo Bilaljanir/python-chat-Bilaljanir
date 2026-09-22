@@ -28,6 +28,15 @@ def release(sock: socket.socket) -> None:
         clients.pop(sock, None)
 
 
+def find(name: str) -> socket.socket | None:
+
+    wanted = name.casefold()
+    with _lock:
+        for sock, taken in clients.items():
+            if taken.casefold() == wanted:
+                return sock
+    return None
+
 def current(conn: socket.socket) -> str:
     with _lock:
         return clients.get(conn, "")

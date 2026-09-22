@@ -23,6 +23,7 @@ from protocol import (
     MAX_TEXT_LEN,
     NICK,
     NOTICE,
+    PRIVATE,
     QUIT,
     RENAME,
     USER_LIST,
@@ -35,6 +36,7 @@ from protocol import (
     enable_keepalive,
     encode,
     iter_messages,
+    private_message,
     send_message,
     system_message,
 )
@@ -239,6 +241,8 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
     payload = message["payload"]
     if message["type"] == COMMAND:
         return run_command(conn, payload["name"], payload["args"])
+    if message["type"] == PRIVATE:
+        return deliver_private(conn, username, payload)
     if message["type"] != CHAT:
         send_message(conn, system_message(ERROR, "Type de message inattendu ici."))
         return True
@@ -253,6 +257,39 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
         )
         return True
     broadcast(chat_message(text, username=username), sender=conn)
+    return True
+
+def deliver_private(conn: socket.socket, username: str, payload: dict) -> bool:
+
+    text = payload["text"].strip()
+    if not text:
+        return True
+    if len(text) > MAX_TEXT_LEN:
+        send_message(
+            conn,
+            system_message(ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."),
+        )
+        return True
+
+    wanted = payload["to"].strip()
+    target = registry.find(wanted)
+    if target is None:
+        send_message(
+            conn, system_message(ERROR, f"Personne ne porte le pseudo « {wanted} ».")
+        )
+        return True
+
+    private = private_message(text, to=registry.current(target), username=username)
+    if not try_send(target, f"{encode(private)}\n".encode()):
+        drop_client(target)
+        send_message(
+            conn, system_message(ERROR, f"{wanted} n'est plus joignable.")
+        )
+        return True
+
+    logger.info("Message privé : %s → %s", username, registry.current(target))
+    if target is not conn:
+        send_message(conn, private)
     return True
 
 

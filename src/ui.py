@@ -34,6 +34,7 @@ USER_COLORS = (
 )
 
 OWN_STYLE = "bold bright_white"
+PRIVATE_STYLE = "magenta"
 SEPARATOR = " -- "
 
 _lock = threading.RLock()
@@ -76,6 +77,24 @@ def chat_line(username: str, text: str, *, mine: bool = False, when: float | Non
     line.append(text)
     return line
 
+def private_line(
+    other: str, text: str, *, mine: bool = False, when: float | None = None
+) -> Text:
+    line = Text(justify="right") if mine else Text()
+    label = f"privé → {other}" if mine else f"privé ← {other}"
+    if mine:
+        line.append(text, style=PRIVATE_STYLE)
+        line.append(SEPARATOR, style="dim")
+        line.append(label, style=f"bold {PRIVATE_STYLE}")
+        line.append(f" {timestamp(when)}", style="dim")
+        return line
+
+    line.append(timestamp(when), style="dim")
+    line.append("  ")
+    line.append(label, style=f"bold {PRIVATE_STYLE}")
+    line.append(SEPARATOR, style="dim")
+    line.append(text, style=PRIVATE_STYLE)
+    return line
 
 def system_line(text: str, style: str, when: float | None = None) -> Text:
     line = Text()

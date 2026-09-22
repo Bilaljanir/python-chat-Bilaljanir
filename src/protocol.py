@@ -8,6 +8,10 @@ MAX_MESSAGE_LEN = 4096
 MAX_TEXT_LEN = 1024
 RECV_SIZE = 1024
 
+KEEPALIVE_IDLE = 30
+KEEPALIVE_INTERVAL = 10
+KEEPALIVE_COUNT = 3
+
 CHAT = "chat"
 SYSTEM = "system"
 COMMAND = "command"
@@ -112,6 +116,27 @@ def send_line(sock: socket.socket, text: str) -> None:
 
 def send_message(sock: socket.socket, message: dict) -> None:
     send_line(sock, encode(message))
+
+
+def enable_keepalive(sock: socket.socket) -> None:
+
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    tuning = (
+        ("TCP_KEEPIDLE", KEEPALIVE_IDLE),
+        ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL),
+        ("TCP_KEEPCNT", KEEPALIVE_COUNT),
+    )
+    for name, value in tuning:
+        option = getattr(socket, name, None)
+        if option is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, option, value)
+        except OSError:
+            pass
 
 def iter_messages(
     reader: "LineReader",

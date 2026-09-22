@@ -26,8 +26,9 @@ $ uv run python src/client.py            # terminal 3  -> pseudo : bob
 8. [Les pièges rencontrés](#8-les-pièges-rencontrés-et-leurs-corrections)
 9. [Paramètres](#9-paramètres)
 10. [Administration et journal](#10-administration-et-journal)
-11. [Tester](#11-tester)
-12. [Par où commencer la lecture](#12-par-où-commencer-la-lecture)
+11. [Robustesse](#11-robustesse-aux-coupures-et-aux-clients-hostiles)
+12. [Tester](#12-tester)
+13. [Par où commencer la lecture](#13-par-où-commencer-la-lecture)
 
 ---
 
@@ -182,9 +183,13 @@ connexion est fermée.
 | `{"type":"command","payload":{"name":"nick","args":[42]}}` | `args` n'est pas une liste de chaînes |
 
 `iter_messages()` attrape ce refus, le signale et **passe à la ligne
-suivante** : le serveur l'écrit dans son journal, le client l'affiche en
-grisé, et la connexion continue. C'est le seul endroit où ce « journaliser et
-ignorer » est écrit, pour les deux bouts.
+suivante** : le serveur l'écrit dans son journal *et prévient l'auteur*, le
+client l'affiche en grisé, et la connexion continue. C'est le seul endroit où
+ce « journaliser et ignorer » est écrit, pour les deux bouts.
+
+Une ligne invalide n'est donc jamais fatale — mais elle est comptée. Au-delà
+de `MAX_INVALID_MESSAGES`, le serveur coupe : voir
+[Robustesse](#11-robustesse-aux-coupures-et-aux-clients-hostiles).
 
 En échange, `decode()` garantit à ses appelants que `message["type"]` est l'un
 des trois types connus, que `message["payload"]` est un dictionnaire et que
@@ -349,10 +354,14 @@ handle_client()
    ├─ broadcast(system_message(JOIN, "x a rejoint le chat"))
    ├─ relay_messages()          boucle jusqu'à déconnexion ou silence
    │
-   └─ retrait du registre
+   └─ finally : retrait du registre                  ← quoi qu'il arrive avant
       broadcast(system_message(LEAVE, "x a quitté le chat"))
-      sem.release()
+      finally : sem.release()                        ← même si la diffusion échoue
 ```
+
+Les deux `finally` valent pour toutes les sorties, y compris les moins polies
+— socket coupée, `kill -9`, erreur imprévue. Le détail est au chapitre
+[Robustesse](#11-robustesse-aux-coupures-et-aux-clients-hostiles).
 
 ---
 
@@ -520,6 +529,9 @@ la forme actuelle du code.
 | `MAX_NAME_ATTEMPTS` | 3 | `server.py` | essais de pseudo avant fermeture |
 | `NAME_PATTERN` | `^[\w.-]{1,24}$` | `registry.py` | pseudos acceptés |
 | `ACCEPT_TIMEOUT` | 0.5 | `server.py` | secondes avant que la boucle d'accueil relise `stop` |
+| `SEND_TIMEOUT` | 5 | `server.py` | secondes d'attente avant de lâcher un client qui ne lit plus |
+| `MAX_INVALID_MESSAGES` | 10 | `server.py` | lignes illisibles tolérées avant fermeture |
+| `KEEPALIVE_IDLE` / `_INTERVAL` / `_COUNT` | 30 / 10 / 3 | `protocol.py` | sondes TCP : un pair disparu est repéré en ~1 min |
 | `ACTIVITY_LINES` | 12 | `admin.py` | lignes de journal gardées en mémoire |
 | `REFRESH_DELAY` | 0.5 | `admin.py` | secondes entre deux redessins |
 
@@ -643,9 +655,146 @@ d'écoute : `accept()` rend la main toutes les demi-secondes, la boucle relit
 sous un `accept()` bloqué dans un autre thread, puis deviner, depuis
 l'`OSError` qui en sort, s'il s'agissait d'un arrêt ou d'une panne.
 
+Le sémaphore est attendu avec le même délai — `sem.acquire(timeout=...)`.
+Serveur plein, l'attente d'une place aurait sinon été le seul endroit où
+`stop` n'était jamais relu : la boucle serait restée bloquée là jusqu'à ce
+qu'un client parte, alors même que l'arrêt était demandé.
+
 ---
 
-## 11. Tester
+## 11. Robustesse aux coupures et aux clients hostiles
+
+Un chat passe l'essentiel de son temps à gérer des départs. Rares sont ceux qui
+tapent `/quit` : on ferme le terminal, on perd le Wi-Fi, on tue le processus.
+Chacun de ces cas doit rester une routine, jamais un incident.
+
+### Une déconnexion brutale est une déconnexion comme une autre
+
+Un `kill -9` ne prévient personne, mais le noyau, lui, ferme la socket. Côté
+serveur, `recv()` rend `b""` (fermeture propre) ou lève `ConnectionResetError`
+(RST). `handle_client()` traite les deux pareil, parce que tout le nettoyage
+tient dans son `finally` :
+
+```python
+finally:
+    try:
+        ...
+        registry.release(conn)
+        broadcast(system_message(LEAVE, f"{username} a quitté le chat", ...))
+    except Exception:
+        logger.exception("Nettoyage incomplet pour %s:%s", host, port)
+    finally:
+        sem.release()
+```
+
+Le `finally` imbriqué est la pièce importante : diffuser un `leave` suppose
+d'écrire sur *d'autres* sockets, qui peuvent échouer à leur tour. Si cette
+diffusion emportait la fonction, le permis du sémaphore ne serait jamais rendu
+— une place perdue à chaque incident, jusqu'à un serveur plein de fantômes.
+
+Le thread, lui, s'arrête de lui-même : il ne boucle que sur `recv()`, et le
+`with conn` ferme la socket en partant.
+
+### Un client ne doit jamais pouvoir faire tomber le serveur
+
+Quatre garde-fous, du plus précis au plus général :
+
+| Situation | Réponse |
+|---|---|
+| ligne illisible | journalisée, `error` renvoyé, ligne suivante |
+| plus de `MAX_INVALID_MESSAGES` lignes illisibles | connexion fermée, en le disant |
+| ligne de plus de `MAX_MESSAGE_LEN` | connexion fermée, en le disant |
+| n'importe quelle autre erreur | `logger.exception`, ce client seul tombe |
+
+Le quota n'est pas de la sévérité gratuite. Sans lui, un client qui déverse du
+charabia garde son thread et sa place **indéfiniment** : chaque octet reçu
+repousse le délai d'inactivité, donc rien ne l'interrompt jamais.
+`InvalidMessageGuard` compte, prévient, puis lève :
+
+```python
+if self.count >= self._limit:
+    raise TooManyInvalidMessages(f"{self.count} messages invalides")
+send_message(self._conn, system_message(ERROR, f"Message ignoré : {error}"))
+```
+
+Le `except Exception` final n'est pas un aveu d'ignorance : c'est la frontière
+du domaine d'un client. Un bug déclenchable à distance doit rester *son*
+problème, pas celui des quarante-neuf autres. Il est journalisé avec sa pile,
+jamais avalé en silence.
+
+### Écrire vers quelqu'un qui n'écoute plus
+
+Le cas vicieux : un client connecté qui ne lit plus. Son tampon de réception se
+remplit, puis celui d'émission du serveur, et `sendall()` bloque — dans le
+thread de *l'expéditeur*. Un seul client figé arrête alors la diffusion pour
+tout le monde.
+
+`try_send()` borne l'attente avec `select()` :
+
+```python
+_, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
+if not writable:
+    return False
+```
+
+Le détour par `select()` plutôt qu'un `settimeout()` est délibéré. Le délai
+d'une socket est un état partagé, et il appartient au thread qui y lit :
+`LineReader` le repositionne avant chaque `recv()` pour tenir la limite
+d'inactivité. Le baisser à cinq secondes depuis un autre thread, le temps d'un
+envoi, ferait expirer la lecture d'en face — et déconnecterait pour « silence »
+un client parfaitement bavard. `select()` ne touche à rien.
+
+Un envoi qui échoue n'est pas rattrapé : `broadcast()` collecte les sockets
+muettes et les passe à `drop_client()`. Le thread du client concerné se réveille
+sur la fermeture et fait son nettoyage habituel.
+
+### Repérer un pair qui a disparu
+
+Une machine qui s'évapore — câble arraché, Wi-Fi coupé, VM suspendue — n'envoie
+rien, pas même un RST. Sans trafic, personne n'échoue : la socket reste ouverte
+des heures. Deux réponses, une par bout :
+
+- **le serveur** impose `IDLE_TIMEOUT` (300 s) : `LineReader` arme un délai
+  avant chaque `recv()`, et un silence trop long vaut un départ ;
+- **les deux bouts** activent `SO_KEEPALIVE` (`enable_keepalive()`), réglé sous
+  Linux à 30 s de silence puis 3 sondes espacées de 10 s. Le pair absent devient
+  alors une erreur en une minute environ, au lieu des deux heures par défaut.
+
+Le client n'a pas de délai d'inactivité : rester une heure sans rien écrire est
+normal pour un lecteur. Le keepalive est sa seule détection — et il affiche
+alors `Connexion perdue : ...` plutôt que de laisser croire à une conversation
+silencieuse.
+
+### Côté client : sortir, quoi qu'il arrive
+
+Le client a deux threads : l'un lit la socket, l'autre bloque sur `input()`.
+Quand la connexion tombe, c'est le premier qui l'apprend — et le second attend
+une frappe qui ne viendra pas. D'où le `finally` :
+
+```python
+except OSError as e:
+    reason = f"Connexion perdue : {e}"
+finally:
+    announce_closed(stop, reason)
+```
+
+`announce_closed()` pose `stop`, affiche la raison, et réveille la saisie par
+un `SIGINT` à soi-même (`interrupt_input()`). Le placer dans un `finally`
+garantit que **même une erreur imprévue** libère l'invite : sans cela, le
+client resterait affiché, curseur clignotant, devant un serveur parti.
+
+La distinction des messages compte pour qui débogue :
+
+| Message | Ce qui s'est passé |
+|---|---|
+| `Connexion impossible : ...` | le `connect()` initial a échoué |
+| `Connexion perdue : ...` | la connexion établie est tombée |
+| `Le serveur s'arrête, à bientôt.` | arrêt annoncé, puis fermeture |
+| `Connexion fermée par le serveur` | fin de flux sans explication |
+
+---
+
+## 12. Tester
 
 ### À la main
 
@@ -660,9 +809,12 @@ Un serveur, deux clients, et on vérifie :
 | il tape `a b` | `Pseudo invalide : ...` |
 | 3 refus d'affilée | connexion fermée |
 | `Ctrl-C` sur bob | alice voit `bob a quitté le chat` |
+| `kill -9 <pid>` du client bob | même chose : la coupure brutale ne change rien |
+| on débranche le réseau de bob | au bout d'une minute, `Connexion perdue : ...` chez bob, `a quitté le chat` chez alice |
 | `Ctrl-C` sur le serveur | les clients voient `Le serveur s'arrête, à bientôt.`, puis la fermeture |
 | `kill <pid>` du serveur (`SIGTERM`) | même chose : l'arrêt propre ne dépend pas du clavier |
 | après coup | `server.log` contient les connexions, départs et refus |
+| tout du long | aucune trace de pile dans le terminal du serveur |
 
 Puis les commandes :
 
@@ -693,11 +845,13 @@ nc localhost 12345
 
 C'est aussi le moyen de vérifier le traitement des messages invalides : tapez
 `n'importe quoi`, puis `{"type":"chat"}`. Le serveur journalise deux refus,
-**garde la connexion ouverte**, et le message suivant passe normalement.
+renvoie deux `error` (« Message ignoré : ... »), **garde la connexion
+ouverte**, et le message suivant passe normalement. Insistez jusqu'à dix
+lignes illisibles et il coupe, en le disant.
 
 ---
 
-## 12. Par où commencer la lecture
+## 13. Par où commencer la lecture
 
 Dans cet ordre, chaque fichier s'appuie sur le précédent :
 

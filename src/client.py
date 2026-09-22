@@ -27,6 +27,7 @@ from protocol import (
     MessageTooLong,
     chat_message,
     command_message,
+    enable_keepalive,
     iter_messages,
     send_message,
 )
@@ -175,18 +176,25 @@ def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None
 def receive_messages(
     messages: Iterator[dict], stop: threading.Event, session: Session
 ) -> None:
+    reason = "Connexion fermée par le serveur"
     try:
         for message in messages:
             if stop.is_set():
                 return
             display(message, session)
-    except (OSError, MessageTooLong):
-        pass
+    except MessageTooLong as e:
+        reason = f"Le serveur a envoyé une ligne trop longue : {e}"
+    except OSError as e:
+        reason = f"Connexion perdue : {e}"
+    finally:
+        announce_closed(stop, reason)
+
+def announce_closed(stop: threading.Event, reason: str) -> None:
 
     if stop.is_set():
         return
     stop.set()
-    show_system("Connexion fermée par le serveur", style="italic yellow")
+    show_system(reason, style="italic yellow")
     if ui.awaiting_input():
         interrupt_input()
 
@@ -221,6 +229,9 @@ def send_user_input(
     except (KeyboardInterrupt, EOFError):
         if not stop.is_set():
             ui.emit(ui.system_line("Déconnecté.", "italic yellow"))
+    except OSError as e:
+        if not stop.is_set():
+            show_system(f"Connexion perdue : {e}", style="italic red")
     finally:
         stop.set()
 
@@ -235,7 +246,12 @@ def main() -> None:
     args = parse_args()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.connect((args.host, args.port))
+            try:
+                sock.connect((args.host, args.port))
+            except OSError as e:
+                show_system(f"Connexion impossible : {e}", style="italic red")
+                return
+            enable_keepalive(sock)
             show_system(f"Connecté à {args.host}:{args.port}", style="italic green")
 
             messages = iter_messages(LineReader(sock), report_invalid)
@@ -256,9 +272,11 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     except OSError as e:
-        show_system(f"Connexion impossible : {e}", style="italic red")
+        show_system(f"Connexion perdue : {e}", style="italic red")
     except MessageTooLong as e:
-        show_system(f"Le serveur a envoyé une ligne trop longue : {e}", style="italic red")
+        show_system(
+            f"Le serveur a envoyé une ligne trop longue : {e}", style="italic red"
+        )
 
 if __name__ == "__main__":
     main()

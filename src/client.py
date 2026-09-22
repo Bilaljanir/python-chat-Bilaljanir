@@ -117,13 +117,14 @@ def show_help() -> None:
     )
 
 
-def parse_command(text: str) -> tuple[str, list[str]]:
+def parse_command(text: str) -> tuple[str, list[str], str]:
     name, _, rest = text[1:].partition(" ")
-    return name.casefold(), rest.split()
+    rest = rest.strip()
+    return name.casefold(), rest.split(), rest
 
 
 def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
-    name, args = parse_command(text)
+    name, args, rest = parse_command(text)
     if name == HELP:
         show_help()
     elif name == QUIT:
@@ -139,15 +140,14 @@ def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
         else:
             send_message(sock, command_message(NICK, args[0]))
     elif name == MSG:
-        send_private(sock, text)
+        send_private(sock, rest)
     else:
         show_system(f"Commande inconnue : /{name} — tapez /help", style="italic red")
     return True
 
-def send_private(sock: socket.socket, text: str) -> None:
+def send_private(sock: socket.socket, rest: str) -> None:
 
-    _, _, rest = text[1:].partition(" ")
-    target, _, body = rest.strip().partition(" ")
+    target, _, body = rest.partition(" ")
     body = body.strip()
     if not target or not body:
         show_system("Usage : /msg <pseudo> <message>", style="italic red")
@@ -172,7 +172,7 @@ def ask_username(prompt: str) -> str | None:
         if not text.startswith("/"):
             return text
 
-        name, args = parse_command(text)
+        name, args, _ = parse_command(text)
         if name == QUIT:
             return None
         if name == HELP:

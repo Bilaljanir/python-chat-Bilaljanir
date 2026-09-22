@@ -96,8 +96,12 @@ def try_send(sock: socket.socket, data: bytes) -> bool:
     return True
 
 
+def try_send_message(sock: socket.socket, message: dict) -> bool:
+    return try_send(sock, f"{encode(message)}\n".encode())
+
+
 def warn_client(sock: socket.socket, text: str) -> None:
-    try_send(sock, f"{encode(system_message(ERROR, text))}\n".encode())
+    try_send_message(sock, system_message(ERROR, text))
 
 class InvalidMessageGuard:
 
@@ -247,47 +251,50 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
         send_message(conn, system_message(ERROR, "Type de message inattendu ici."))
         return True
 
-    text = payload["text"].strip()
-    if not text:
-        return True
-    if len(text) > MAX_TEXT_LEN:
-        send_message(
-            conn,
-            system_message(ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."),
-        )
+    text = clean_text(conn, payload)
+    if text is None:
         return True
     broadcast(chat_message(text, username=username), sender=conn)
     return True
 
-def deliver_private(conn: socket.socket, username: str, payload: dict) -> bool:
+
+def clean_text(conn: socket.socket, payload: dict) -> str | None:
 
     text = payload["text"].strip()
     if not text:
-        return True
+        return None
     if len(text) > MAX_TEXT_LEN:
         send_message(
             conn,
             system_message(ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."),
         )
+        return None
+    return text
+
+def deliver_private(conn: socket.socket, username: str, payload: dict) -> bool:
+
+    text = clean_text(conn, payload)
+    if text is None:
         return True
 
     wanted = payload["to"].strip()
-    target = registry.find(wanted)
-    if target is None:
+    found = registry.find(wanted)
+    if found is None:
         send_message(
             conn, system_message(ERROR, f"Personne ne porte le pseudo « {wanted} ».")
         )
         return True
+    target, target_name = found
 
-    private = private_message(text, to=registry.current(target), username=username)
-    if not try_send(target, f"{encode(private)}\n".encode()):
+    private = private_message(text, to=target_name, username=username)
+    if not try_send_message(target, private):
         drop_client(target)
         send_message(
-            conn, system_message(ERROR, f"{wanted} n'est plus joignable.")
+            conn, system_message(ERROR, f"{target_name} n'est plus joignable.")
         )
         return True
 
-    logger.info("Message privé : %s → %s", username, registry.current(target))
+    logger.info("Message privé : %s → %s", username, target_name)
     if target is not conn:
         send_message(conn, private)
     return True

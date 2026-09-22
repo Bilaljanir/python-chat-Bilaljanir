@@ -1,6 +1,7 @@
 import argparse
 import logging
 import math
+import select
 import signal
 import socket
 import threading
@@ -18,6 +19,7 @@ from protocol import (
     ERROR,
     JOIN,
     LEAVE,
+    MAX_MESSAGE_LEN,
     MAX_TEXT_LEN,
     NICK,
     NOTICE,
@@ -30,6 +32,7 @@ from protocol import (
     LineReader,
     MessageTooLong,
     chat_message,
+    enable_keepalive,
     encode,
     iter_messages,
     send_message,
@@ -44,8 +47,16 @@ IDLE_TIMEOUT = 300
 MAX_NAME_ATTEMPTS = 3
 RETRY_DELAY = 0.1
 ACCEPT_TIMEOUT = 0.5
+SEND_TIMEOUT = 5.0
+MAX_INVALID_MESSAGES = 10
 LOG_EXCERPT_LEN = 120
 SHUTDOWN_NOTICE = "Le serveur s'arrête, à bientôt."
+TOO_MANY_INVALID = "Trop de messages invalides, connexion fermée."
+LINE_TOO_LONG = f"Ligne de plus de {MAX_MESSAGE_LEN} caractères, connexion fermée."
+
+
+class TooManyInvalidMessages(Exception):
+    """Un client a dépassé son quota de messages illisibles."""
 
 def drop_client(sock: socket.socket) -> None:
     registry.release(sock)
@@ -72,27 +83,47 @@ def broadcast(message: dict, sender: socket.socket | None = None) -> None:
         drop_client(sock)
 
 def try_send(sock: socket.socket, data: bytes) -> bool:
+
     try:
+        _, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
+        if not writable:
+            return False
         sock.sendall(data)
-    except OSError:
+    except (OSError, ValueError):
         return False
     return True
 
-def invalid_message_logger(
-    address: tuple[str, int],
-) -> Callable[[str, InvalidMessage], None]:
-    host, port = address
 
-    def report(line: str, error: InvalidMessage) -> None:
+def warn_client(sock: socket.socket, text: str) -> None:
+    try_send(sock, f"{encode(system_message(ERROR, text))}\n".encode())
+
+class InvalidMessageGuard:
+
+    def __init__(
+        self,
+        conn: socket.socket,
+        address: tuple[str, int],
+        limit: int = MAX_INVALID_MESSAGES,
+    ) -> None:
+        self._conn = conn
+        self._host, self._port = address
+        self._limit = limit
+        self.count = 0
+
+    def __call__(self, line: str, error: InvalidMessage) -> None:
+        self.count += 1
         logger.warning(
-            "Message invalide de %s:%s : %s — %s",
-            host,
-            port,
+            "Message invalide de %s:%s (%d/%d) : %s — %s",
+            self._host,
+            self._port,
+            self.count,
+            self._limit,
             error,
             line[:LOG_EXCERPT_LEN],
         )
-
-    return report
+        if self.count >= self._limit:
+            raise TooManyInvalidMessages(f"{self.count} messages invalides")
+        warn_client(self._conn, f"Message ignoré : {error}")
 
 def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | None:
 
@@ -144,7 +175,7 @@ def handle_client(
     host, port = address
     username: str | None = None
     reader = LineReader(conn, idle_timeout)
-    messages = iter_messages(reader, invalid_message_logger(address))
+    messages = iter_messages(reader, InvalidMessageGuard(conn, address))
 
     try:
         with conn:
@@ -169,8 +200,14 @@ def handle_client(
                     )
             except MessageTooLong as e:
                 logger.warning("Ligne trop longue de %s:%s : %s", host, port, e)
+                warn_client(conn, LINE_TOO_LONG)
+            except TooManyInvalidMessages as e:
+                logger.warning("Client incompris coupé %s:%s : %s", host, port, e)
+                warn_client(conn, TOO_MANY_INVALID)
             except (ConnectionError, TimeoutError, OSError):
                 pass
+            except Exception:
+                logger.exception("Erreur inattendue avec %s:%s", host, port)
     finally:
         try:
             if username is None:
@@ -185,6 +222,8 @@ def handle_client(
                     sender=conn,
                 )
                 logger.info("Déconnexion : %s (%s:%s)", username, host, port)
+        except Exception:
+            logger.exception("Nettoyage incomplet pour %s:%s", host, port)
         finally:
             sem.release()
 
@@ -327,13 +366,15 @@ def serve(
     stop = stop or threading.Event()
     server_socket.settimeout(ACCEPT_TIMEOUT)
     while not stop.is_set():
-        sem.acquire()
+        if not sem.acquire(timeout=ACCEPT_TIMEOUT):
+            continue
         conn = None
         started = False
         try:
             if stop.is_set():
                 break
             conn, address = server_socket.accept()
+            enable_keepalive(conn)
             threading.Thread(
                 target=handle_client,
                 args=(conn, address, sem, idle_timeout),
@@ -346,6 +387,9 @@ def serve(
             if server_socket.fileno() == -1:
                 break
             logger.warning("Connexion abandonnée : %s", e)
+            time.sleep(RETRY_DELAY)
+        except Exception:
+            logger.exception("Accueil en échec, la boucle continue")
             time.sleep(RETRY_DELAY)
         finally:
             if not started:

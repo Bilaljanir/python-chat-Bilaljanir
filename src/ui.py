@@ -34,6 +34,7 @@ USER_COLORS = (
 )
 
 OWN_STYLE = "bold bright_white"
+PRIVATE_STYLE = "magenta"
 SEPARATOR = " -- "
 
 _lock = threading.RLock()
@@ -60,22 +61,52 @@ def timestamp(when: float | None = None) -> str:
     return time.strftime("%H:%M:%S", time.localtime(when))
 
 
-def chat_line(username: str, text: str, *, mine: bool = False, when: float | None = None) -> Text:
+def _line(
+    label: str,
+    text: str,
+    *,
+    label_style: str,
+    text_style: str | None = None,
+    mine: bool = False,
+    when: float | None = None,
+) -> Text:
     line = Text(justify="right") if mine else Text()
     if mine:
-        line.append(text)
+        line.append(text, style=text_style)
         line.append(SEPARATOR, style="dim")
-        line.append(username, style=OWN_STYLE)
+        line.append(label, style=label_style)
         line.append(f" {timestamp(when)}", style="dim")
         return line
 
     line.append(timestamp(when), style="dim")
     line.append("  ")
-    line.append(username, style=f"bold {user_style(username)}")
+    line.append(label, style=label_style)
     line.append(SEPARATOR, style="dim")
-    line.append(text)
+    line.append(text, style=text_style)
     return line
 
+
+def chat_line(username: str, text: str, *, mine: bool = False, when: float | None = None) -> Text:
+    return _line(
+        username,
+        text,
+        label_style=OWN_STYLE if mine else f"bold {user_style(username)}",
+        mine=mine,
+        when=when,
+    )
+
+
+def private_line(
+    other: str, text: str, *, mine: bool = False, when: float | None = None
+) -> Text:
+    return _line(
+        f"privé → {other}" if mine else f"privé ← {other}",
+        text,
+        label_style=f"bold {PRIVATE_STYLE}",
+        text_style=PRIVATE_STYLE,
+        mine=mine,
+        when=when,
+    )
 
 def system_line(text: str, style: str, when: float | None = None) -> Text:
     line = Text()

@@ -14,8 +14,10 @@ from protocol import (
     JOIN,
     LEAVE,
     MAX_TEXT_LEN,
+    MSG,
     NICK,
     NOTICE,
+    PRIVATE,
     QUIT,
     RENAME,
     SYSTEM,
@@ -29,6 +31,7 @@ from protocol import (
     command_message,
     enable_keepalive,
     iter_messages,
+    private_message,
     send_message,
 )
 
@@ -47,6 +50,7 @@ COMMAND_HELP = {
     HELP: ("/help", "affiche cette aide"),
     USERS: ("/users", "liste les utilisateurs connectés"),
     NICK: ("/nick <pseudo>", "change de pseudo"),
+    MSG: ("/msg <pseudo> <message>", "message privé à une seule personne"),
     QUIT: ("/quit", "quitte le chat"),
 }
 
@@ -78,12 +82,21 @@ def display(message: dict, session: Session) -> None:
     payload = message["payload"]
     if message["type"] == CHAT:
         ui.emit(ui.chat_line(payload.get("username", "?"), payload["text"]))
+    elif message["type"] == PRIVATE:
+        display_private(payload, session)
     elif message["type"] == SYSTEM:
         track_rename(payload, session)
         show_system(
             payload["text"], SYSTEM_STYLES.get(payload["event"], DEFAULT_SYSTEM_STYLE)
         )
 
+
+def display_private(payload: dict, session: Session) -> None:
+
+    sender = payload.get("username", "?")
+    mine = sender == session.username
+    other = payload["to"] if mine else sender
+    ui.emit(ui.private_line(other, payload["text"], mine=mine))
 
 def track_rename(payload: dict, session: Session) -> None:
 
@@ -104,13 +117,14 @@ def show_help() -> None:
     )
 
 
-def parse_command(text: str) -> tuple[str, list[str]]:
+def parse_command(text: str) -> tuple[str, list[str], str]:
     name, _, rest = text[1:].partition(" ")
-    return name.casefold(), rest.split()
+    rest = rest.strip()
+    return name.casefold(), rest.split(), rest
 
 
 def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
-    name, args = parse_command(text)
+    name, args, rest = parse_command(text)
     if name == HELP:
         show_help()
     elif name == QUIT:
@@ -125,9 +139,27 @@ def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
             show_system("Usage : /nick <pseudo>", style="italic red")
         else:
             send_message(sock, command_message(NICK, args[0]))
+    elif name == MSG:
+        send_private(sock, rest)
     else:
         show_system(f"Commande inconnue : /{name} — tapez /help", style="italic red")
     return True
+
+def send_private(sock: socket.socket, rest: str) -> None:
+
+    target, _, body = rest.partition(" ")
+    body = body.strip()
+    if not target or not body:
+        show_system("Usage : /msg <pseudo> <message>", style="italic red")
+        return
+    if len(body) > MAX_TEXT_LEN:
+        show_system(
+            f"Message trop long ({len(body)} > {MAX_TEXT_LEN} caractères),"
+            " rien n'a été envoyé.",
+            style="italic red",
+        )
+        return
+    send_message(sock, private_message(body, to=target))
 
 def ask_username(prompt: str) -> str | None:
     while True:
@@ -140,7 +172,7 @@ def ask_username(prompt: str) -> str | None:
         if not text.startswith("/"):
             return text
 
-        name, args = parse_command(text)
+        name, args, _ = parse_command(text)
         if name == QUIT:
             return None
         if name == HELP:

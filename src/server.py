@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 from rich.console import Console, RenderableType
 
 import admin
+import history
 import registry
 from protocol import (
     ASK_USERNAME,
@@ -35,10 +36,13 @@ from protocol import (
     chat_message,
     enable_keepalive,
     encode,
+    history_message,
     iter_messages,
     private_message,
-    send_message,
     system_message,
+)
+from protocol import (
+    send_message as write_message,
 )
 
 console = Console()
@@ -60,8 +64,35 @@ LINE_TOO_LONG = f"Ligne de plus de {MAX_MESSAGE_LEN} caractères, connexion ferm
 class TooManyInvalidMessages(Exception):
     """Un client a dépassé son quota de messages illisibles."""
 
+
+_send_locks: dict[socket.socket, threading.Lock] = {}
+_send_locks_guard = threading.Lock()
+# Rend atomiques « mémoriser + choisir les destinataires » d'un message public
+# et « s'inscrire + photographier l'historique » d'un arrivant : chaque message
+# lui parvient soit dans l'historique, soit en direct, jamais les deux.
+_chat_lock = threading.Lock()
+
+
+def send_lock(sock: socket.socket) -> threading.Lock:
+    """Le verrou d'écriture du client, créé au premier envoi."""
+    with _send_locks_guard:
+        return _send_locks.setdefault(sock, threading.Lock())
+
+
+def forget_send_lock(sock: socket.socket) -> None:
+    with _send_locks_guard:
+        _send_locks.pop(sock, None)
+
+
+def send_message(sock: socket.socket, message: dict) -> None:
+    """Écrit une trame complète : les threads ne s'entrelacent pas."""
+    with send_lock(sock):
+        write_message(sock, message)
+
+
 def drop_client(sock: socket.socket) -> None:
     registry.release(sock)
+    forget_send_lock(sock)
     try:
         sock.shutdown(socket.SHUT_RDWR)
     except OSError:
@@ -77,20 +108,23 @@ def shutdown_clients() -> int:
     return warned
 
 def broadcast(message: dict, sender: socket.socket | None = None) -> None:
+    send_to(registry.targets(exclude=sender), message)
+
+
+def send_to(socks: list[socket.socket], message: dict) -> None:
     data = f"{encode(message)}\n".encode()
-    unreachable = [
-        sock for sock in registry.targets(exclude=sender) if not try_send(sock, data)
-    ]
+    unreachable = [sock for sock in socks if not try_send(sock, data)]
     for sock in unreachable:
         drop_client(sock)
 
 def try_send(sock: socket.socket, data: bytes) -> bool:
 
     try:
-        _, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
-        if not writable:
-            return False
-        sock.sendall(data)
+        with send_lock(sock):
+            _, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
+            if not writable:
+                return False
+            sock.sendall(data)
     except (OSError, ValueError):
         return False
     return True
@@ -147,19 +181,30 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
             )
             continue
 
-        refusal = registry.claim(conn, name)
+        writing = send_lock(conn)
+        with _chat_lock:
+            writing.acquire()
+            refusal = registry.claim(conn, name)
+            backlog = history.recent() if refusal is None else []
         if refusal is None:
+            # Les envois des autres threads attendent ce verrou : l'accueil et
+            # l'historique passent avant tout message en direct.
             try:
-                send_message(
+                write_message(
                     conn,
                     system_message(
                         WELCOME, f"Connecté en tant que {name}", username=name
                     ),
                 )
+                for frame in history_frames(backlog):
+                    write_message(conn, frame)
             except OSError:
                 registry.release(conn)
                 raise
+            finally:
+                writing.release()
             return name
+        writing.release()
         send_message(conn, system_message(ERROR, refusal))
 
     send_message(conn, system_message(ERROR, "Trop de tentatives, connexion fermée."))
@@ -231,7 +276,27 @@ def handle_client(
         except Exception:
             logger.exception("Nettoyage incomplet pour %s:%s", host, port)
         finally:
+            forget_send_lock(conn)
             sem.release()
+
+
+def history_frames(entries: list[dict]) -> list[dict]:
+    """Découpe l'historique en lots qui tiennent chacun dans une ligne."""
+    batches: list[list[dict]] = [[]]
+    for entry in entries:
+        if history_fits(batches[-1] + [entry]):
+            batches[-1].append(entry)
+        elif history_fits([entry]):
+            batches.append([entry])
+        else:
+            logger.warning("Message trop long pour l'historique, ignoré")
+    last = len(batches) - 1
+    return [history_message(batch, more=i < last) for i, batch in enumerate(batches)]
+
+
+def history_fits(batch: list[dict]) -> bool:
+    return len(encode(history_message(batch, more=True))) <= MAX_MESSAGE_LEN
+
 
 def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
     for message in messages:
@@ -254,7 +319,10 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
     text = clean_text(conn, payload)
     if text is None:
         return True
-    broadcast(chat_message(text, username=username), sender=conn)
+    with _chat_lock:
+        history.remember(text, username)
+        socks = registry.targets(exclude=conn)
+    send_to(socks, chat_message(text, username=username))
     return True
 
 

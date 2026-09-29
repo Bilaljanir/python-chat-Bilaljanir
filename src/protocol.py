@@ -16,6 +16,7 @@ CHAT = "chat"
 SYSTEM = "system"
 COMMAND = "command"
 PRIVATE = "private"
+HISTORY = "history"
 
 ASK_USERNAME = "ask_username"
 WELCOME = "welcome"
@@ -37,6 +38,7 @@ REQUIRED_FIELDS = {
     SYSTEM: ("event", "text"),
     COMMAND: ("name",),
     PRIVATE: ("text", "to"),
+    HISTORY: (),
 }
 
 
@@ -62,6 +64,11 @@ def private_message(text: str, to: str, username: str | None = None) -> dict:
     if username is not None:
         payload["username"] = username
     return {"type": PRIVATE, "payload": payload}
+
+
+def history_message(entries: list[dict], more: bool = False) -> dict:
+    """Un lot d'historique ; « more » annonce qu'un autre lot suit."""
+    return {"type": HISTORY, "payload": {"messages": entries, "more": more}}
 
 def command_message(name: str, *args: str) -> dict:
     return {"type": COMMAND, "payload": {"name": name, "args": list(args)}}
@@ -106,11 +113,27 @@ def _check_payload(message_type: str, payload: dict) -> None:
         _check_optional_text(payload, "username")
     elif message_type == COMMAND:
         payload["args"] = _checked_args(payload.get("args", []))
+    elif message_type == HISTORY:
+        payload["messages"] = _checked_history(payload.get("messages", []))
+        if not isinstance(payload.get("more", False), bool):
+            raise InvalidMessage("champ « more » non booléen")
 
 
 def _check_optional_text(payload: dict, field: str) -> None:
     if field in payload and not isinstance(payload[field], str):
         raise InvalidMessage(f"champ « {field} » non textuel")
+
+
+def _checked_history(entries: object) -> list[dict]:
+    if not isinstance(entries, list):
+        raise InvalidMessage("« messages » doit être une liste")
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("text"), str):
+            raise InvalidMessage("entrée d'historique sans texte")
+        _check_optional_text(entry, "username")
+        if "at" in entry and not isinstance(entry["at"], (int, float)):
+            raise InvalidMessage("champ « at » non numérique")
+    return entries
 
 
 def _checked_args(args: object) -> list[str]:

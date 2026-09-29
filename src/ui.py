@@ -108,6 +108,17 @@ def private_line(
         when=when,
     )
 
+
+def history_line(username: str, text: str, when: float | None = None) -> Text:
+    return _line(
+        username,
+        text,
+        label_style=f"dim {user_style(username)}",
+        text_style="dim",
+        when=when,
+    )
+
+
 def system_line(text: str, style: str, when: float | None = None) -> Text:
     line = Text()
     line.append(timestamp(when), style="dim")

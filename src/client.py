@@ -11,6 +11,7 @@ from protocol import (
     CHAT,
     ERROR,
     HELP,
+    HISTORY,
     JOIN,
     LEAVE,
     MAX_TEXT_LEN,
@@ -89,6 +90,28 @@ def display(message: dict, session: Session) -> None:
         show_system(
             payload["text"], SYSTEM_STYLES.get(payload["event"], DEFAULT_SYSTEM_STYLE)
         )
+
+
+def receive_history(messages: Iterator[dict]) -> None:
+    """Affiche les lots d'historique envoyés juste après l'accueil."""
+    shown = False
+    for message in messages:
+        if message["type"] != HISTORY:
+            break
+        payload = message["payload"]
+        for entry in payload["messages"]:
+            if not shown:
+                ui.separator("messages précédents")
+                shown = True
+            ui.emit(
+                ui.history_line(
+                    entry.get("username", "?"), entry["text"], entry.get("at")
+                )
+            )
+        if not payload.get("more", False):
+            break
+    if shown:
+        ui.separator("fin des messages précédents")
 
 
 def display_private(payload: dict, session: Session) -> None:
@@ -198,6 +221,7 @@ def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None
         elif event == WELCOME:
             ui.emit(ui.banner(payload["text"]))
             show_system("Tapez /help pour la liste des commandes.", style="dim italic cyan")
+            receive_history(messages)
             return payload.get("username", "")
         else:
             show_system(payload["text"], SYSTEM_STYLES.get(event, DEFAULT_SYSTEM_STYLE))

@@ -1,3 +1,5 @@
+"""Le serveur du chat : accepte les clients, gère les pseudos et relaie les messages."""
+
 import argparse
 import logging
 import math
@@ -79,6 +81,7 @@ def send_lock(sock: socket.socket) -> threading.Lock:
 
 
 def forget_send_lock(sock: socket.socket) -> None:
+    """Oublie le verrou d'écriture d'un client parti."""
     with _send_locks_guard:
         _send_locks.pop(sock, None)
 
@@ -90,6 +93,7 @@ def send_message(sock: socket.socket, message: dict) -> None:
 
 
 def drop_client(sock: socket.socket) -> None:
+    """Retire un client et coupe sa connexion ; son thread fait le reste."""
     registry.release(sock)
     close_outbox(sock)
     forget_send_lock(sock)
@@ -100,6 +104,7 @@ def drop_client(sock: socket.socket) -> None:
 
 
 def shutdown_clients() -> int:
+    """Prévient puis déconnecte tous les clients ; renvoie le nombre de prévenus."""
     socks = registry.drain()
     data = f"{encode(system_message(NOTICE, SHUTDOWN_NOTICE))}\n".encode()
     warned = sum(try_send(sock, data) for sock in socks)
@@ -109,6 +114,7 @@ def shutdown_clients() -> int:
 
 
 def broadcast(message: dict, sender: socket.socket | None = None) -> None:
+    """Diffuse un message à tous les clients, sauf l'expéditeur."""
     send_to(registry.targets(exclude=sender), message)
 
 
@@ -128,12 +134,14 @@ class Outbox:
     """
 
     def __init__(self, sock: socket.socket) -> None:
+        """Crée la file et démarre le thread d'écriture."""
         self._sock = sock
         self._queue: queue.Queue[bytes | None] = queue.Queue(OUTBOX_SIZE)
         self._closed = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
     def put(self, data: bytes) -> bool:
+        """Dépose des données ; faux si la file est fermée ou pleine."""
         if self._closed.is_set():
             return False
         try:
@@ -143,6 +151,7 @@ class Outbox:
         return True
 
     def close(self) -> None:
+        """Arrête le thread d'écriture."""
         self._closed.set()
         try:
             self._queue.put_nowait(None)
@@ -164,11 +173,13 @@ _outboxes_guard = threading.Lock()
 
 
 def open_outbox(sock: socket.socket) -> None:
+    """Crée la file d'envoi d'un nouveau client."""
     with _outboxes_guard:
         _outboxes[sock] = Outbox(sock)
 
 
 def close_outbox(sock: socket.socket) -> None:
+    """Ferme et oublie la file d'envoi d'un client."""
     with _outboxes_guard:
         outbox = _outboxes.pop(sock, None)
     if outbox is not None:
@@ -183,6 +194,7 @@ def post(sock: socket.socket, data: bytes) -> bool:
 
 
 def try_send(sock: socket.socket, data: bytes) -> bool:
+    """Écrit des données en attendant au plus SEND_TIMEOUT ; faux en cas d'échec."""
     try:
         with send_lock(sock):
             _, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
@@ -195,26 +207,32 @@ def try_send(sock: socket.socket, data: bytes) -> bool:
 
 
 def try_send_message(sock: socket.socket, message: dict) -> bool:
+    """Encode et envoie un message avec try_send."""
     return try_send(sock, f"{encode(message)}\n".encode())
 
 
 def warn_client(sock: socket.socket, text: str) -> None:
+    """Envoie une erreur à un client sans se soucier du résultat."""
     try_send_message(sock, system_message(ERROR, text))
 
 
 class InvalidMessageGuard:
+    """Compte les messages illisibles d'un client et le coupe au-delà d'une limite."""
+
     def __init__(
         self,
         conn: socket.socket,
         address: tuple[str, int],
         limit: int = MAX_INVALID_MESSAGES,
     ) -> None:
+        """Prépare le compteur pour la connexion donnée."""
         self._conn = conn
         self._host, self._port = address
         self._limit = limit
         self.count = 0
 
     def __call__(self, line: str, error: InvalidMessage) -> None:
+        """Journalise un message invalide, prévient le client ou le coupe."""
         self.count += 1
         logger.warning(
             "Message invalide de %s:%s (%d/%d) : %s — %s",
@@ -231,6 +249,7 @@ class InvalidMessageGuard:
 
 
 def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | None:
+    """Demande un pseudo, puis envoie l'accueil et l'historique."""
     for _ in range(MAX_NAME_ATTEMPTS):
         send_message(conn, system_message(ASK_USERNAME, "Choisissez un pseudo"))
         message = next(messages, None)
@@ -276,6 +295,7 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
 
 
 def username_proposal(message: dict) -> str | None:
+    """Extrait le pseudo d'une commande nick, ou None."""
     payload = message["payload"]
     if message["type"] != COMMAND or payload["name"] != NICK:
         return None
@@ -289,6 +309,7 @@ def handle_client(
     sem: threading.Semaphore,
     idle_timeout: float,
 ) -> None:
+    """Gère un client de sa connexion à son départ."""
     host, port = address
     username: str | None = None
     reader = LineReader(conn, idle_timeout)
@@ -351,6 +372,7 @@ def handle_client(
 
 
 def history_frames(entries: list[dict]) -> list[dict]:
+    """Découpe l'historique en lots qui tiennent chacun dans une ligne."""
     budget = MAX_MESSAGE_LEN - len(encode(history_message([], more=False)))
     batches: list[list[dict]] = [[]]
     used = 0
@@ -369,6 +391,7 @@ def history_frames(entries: list[dict]) -> list[dict]:
 
 
 def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
+    """Traite les messages d'un client tant qu'il est inscrit."""
     for message in messages:
         username = registry.current(conn)
         if not username:
@@ -378,6 +401,7 @@ def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
 
 
 def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
+    """Traite un message ; renvoie False quand le client veut partir."""
     payload = message["payload"]
     if message["type"] == COMMAND:
         return run_command(conn, payload["name"], payload["args"])
@@ -400,6 +424,7 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
 
 
 def clean_text(conn: socket.socket, payload: dict) -> str | None:
+    """Nettoie le texte d'un message ; None s'il est vide ou trop long."""
     text = payload["text"].strip()
     if not text:
         return None
@@ -415,6 +440,7 @@ def clean_text(conn: socket.socket, payload: dict) -> str | None:
 
 
 def deliver_private(conn: socket.socket, username: str, payload: dict) -> bool:
+    """Transmet un message privé à son destinataire et une copie à l'expéditeur."""
     text = clean_text(conn, payload)
     if text is None:
         return True
@@ -443,6 +469,7 @@ def deliver_private(conn: socket.socket, username: str, payload: dict) -> bool:
 
 
 def run_command(conn: socket.socket, name: str, args: list[str]) -> bool:
+    """Exécute une commande du client ; renvoie False pour /quit."""
     if name == QUIT:
         return False
     if name == USERS:
@@ -456,6 +483,7 @@ def run_command(conn: socket.socket, name: str, args: list[str]) -> bool:
 
 
 def user_list_message() -> dict:
+    """Construit la liste des utilisateurs connectés."""
     names = registry.usernames()
     listed = ", ".join(names) if names else "personne"
     return system_message(
@@ -464,6 +492,7 @@ def user_list_message() -> dict:
 
 
 def rename(conn: socket.socket, new_name: str) -> None:
+    """Change le pseudo d'un client et prévient les autres."""
     old_name = registry.current(conn)
     if new_name == old_name:
         send_message(conn, system_message(ERROR, "C'est déjà votre pseudo"))
@@ -496,6 +525,7 @@ def rename(conn: socket.socket, new_name: str) -> None:
 
 
 def positive_float(value: str) -> float:
+    """Type argparse : un nombre fini strictement positif."""
     number = float(value)
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError(
@@ -505,6 +535,7 @@ def positive_float(value: str) -> float:
 
 
 def positive_int(value: str) -> int:
+    """Type argparse : un entier strictement positif."""
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError(f"must be greater than 0 (got {value!r})")
@@ -512,6 +543,7 @@ def positive_int(value: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
+    """Lit les options du serveur sur la ligne de commande."""
     parser = argparse.ArgumentParser(description="TCP chat server")
     parser.add_argument(
         "--port", "-p", type=int, default=12345, help="Port to listen on"
@@ -551,6 +583,7 @@ def serve(
     idle_timeout: float,
     stop: threading.Event,
 ) -> None:
+    """Accepte les connexions et lance un thread par client jusqu'à l'arrêt."""
     sem = threading.Semaphore(max_clients)
     server_socket.settimeout(ACCEPT_TIMEOUT)
     while not stop.is_set():
@@ -588,6 +621,7 @@ def serve(
 
 
 def install_stop_handlers(stop: threading.Event) -> None:
+    """Fait de Ctrl-C et SIGTERM une demande d'arrêt propre."""
 
     def request_stop(signum: int, _frame: object) -> None:
         signal.signal(signum, signal.SIG_DFL)
@@ -600,6 +634,7 @@ def install_stop_handlers(stop: threading.Event) -> None:
 def dashboard_snapshot(
     address: str, max_clients: int, activity: admin.ActivityLog
 ) -> Callable[[], RenderableType]:
+    """Renvoie une fonction qui dessine l'état actuel du serveur."""
     started = time.monotonic()
 
     def snapshot() -> RenderableType:
@@ -615,6 +650,7 @@ def dashboard_snapshot(
 
 
 def main() -> None:
+    """Démarre le serveur, le sert jusqu'à l'arrêt, puis déconnecte les clients."""
     args = parse_args()
     host = "0.0.0.0"
     address = f"{host}:{args.port}"

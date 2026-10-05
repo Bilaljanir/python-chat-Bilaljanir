@@ -1,3 +1,5 @@
+"""Côté administrateur du serveur : journal, tableau de bord et niveaux de log."""
+
 import logging
 import threading
 import time
@@ -34,21 +36,27 @@ logger = logging.getLogger(LOGGER_NAME)
 
 
 class ActivityLog(logging.Handler):
+    """Handler de log qui garde les dernières lignes pour le tableau de bord."""
+
     def __init__(self) -> None:
+        """Prépare un tampon borné à ACTIVITY_LINES entrées."""
         super().__init__()
         self._records: deque[tuple[float, int, str]] = deque(maxlen=ACTIVITY_LINES)
 
     def emit(self, record: logging.LogRecord) -> None:
+        """Ajoute un enregistrement au tampon."""
         try:
             self._records.append((record.created, record.levelno, record.getMessage()))
         except (TypeError, ValueError):
             self.handleError(record)
 
     def lines(self) -> list[tuple[float, int, str]]:
+        """Renvoie une copie des dernières lignes (heure, niveau, message)."""
         return list(self._records)
 
 
 def setup_logging(path: str, console: Console, console_level: int) -> ActivityLog:
+    """Branche le fichier, le terminal et le tampon d'activité sur le logger."""
     logger.setLevel(logging.INFO)
     logger.propagate = False
     for handler in list(logger.handlers):
@@ -75,6 +83,7 @@ def setup_logging(path: str, console: Console, console_level: int) -> ActivityLo
 
 
 def uptime(seconds: float) -> str:
+    """Formate une durée en secondes sous la forme HH:MM:SS."""
     hours, rest = divmod(int(seconds), 3600)
     minutes, secs = divmod(rest, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
@@ -87,6 +96,7 @@ def _grid() -> Table:
 def status_table(
     address: str, users: list[str], max_clients: int, elapsed: float
 ) -> Table:
+    """Construit le tableau d'état : adresse, clients, durée, connectés."""
     table = _grid()
     table.add_column(style="bold cyan", no_wrap=True)
     table.add_column(overflow="fold")
@@ -101,6 +111,7 @@ def status_table(
 
 
 def activity_table(lines: list[tuple[float, int, str]]) -> Table:
+    """Construit le tableau des derniers événements du journal."""
     table = _grid()
     table.add_column(style="dim", no_wrap=True)
     table.add_column(no_wrap=True)
@@ -126,6 +137,7 @@ def dashboard(
     elapsed: float,
     lines: list[tuple[float, int, str]],
 ) -> RenderableType:
+    """Assemble les deux panneaux du tableau de bord."""
     return Group(
         Panel(
             status_table(address, users, max_clients, elapsed),
@@ -147,6 +159,7 @@ def run_dashboard(
     snapshot: Callable[[], RenderableType],
     stop: threading.Event,
 ) -> None:
+    """Redessine le tableau de bord jusqu'à ce que l'arrêt soit demandé."""
     with Live(snapshot(), console=console, refresh_per_second=4) as live:
         while not stop.wait(REFRESH_DELAY):
             live.update(snapshot())

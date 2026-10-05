@@ -1,3 +1,5 @@
+"""Le client du chat : choix du pseudo, saisie et réception des messages."""
+
 import argparse
 import itertools
 import os
@@ -58,29 +60,37 @@ COMMAND_HELP = {
 
 
 class Session:
+    """Le pseudo courant, partagé entre le thread de saisie et celui de réception."""
+
     def __init__(self, username: str) -> None:
+        """Démarre la session avec le pseudo accepté par le serveur."""
         self._username = username
         self._lock = threading.Lock()
 
     @property
     def username(self) -> str:
+        """Le pseudo actuel."""
         with self._lock:
             return self._username
 
     def rename(self, new_username: str) -> None:
+        """Remplace le pseudo après un renommage."""
         with self._lock:
             self._username = new_username
 
 
 def show_system(text: str, style: str = DEFAULT_SYSTEM_STYLE) -> None:
+    """Affiche un message d'information local."""
     ui.emit(ui.system_line(text, style))
 
 
 def report_invalid(line: str, error: InvalidMessage) -> None:
+    """Signale un message du serveur qui ne respecte pas le protocole."""
     show_system(f"message ignoré : {error}", style="dim italic yellow")
 
 
 def display(message: dict, session: Session) -> None:
+    """Affiche un message reçu selon son type."""
     payload = message["payload"]
     if message["type"] == CHAT:
         ui.emit(ui.chat_line(payload.get("username", "?"), payload["text"]))
@@ -122,6 +132,7 @@ def receive_history(messages: Iterator[dict]) -> Iterator[dict]:
 
 
 def display_private(payload: dict, session: Session) -> None:
+    """Affiche un message privé, qu'on l'ait envoyé ou reçu."""
     sender = payload.get("username", "?")
     mine = sender == session.username
     other = payload["to"] if mine else sender
@@ -129,6 +140,7 @@ def display_private(payload: dict, session: Session) -> None:
 
 
 def track_rename(payload: dict, session: Session) -> None:
+    """Met à jour la session quand le serveur confirme notre nouveau pseudo."""
     if payload["event"] != RENAME or payload.get("username") != session.username:
         return
     new_username = payload.get("new_username")
@@ -137,6 +149,7 @@ def track_rename(payload: dict, session: Session) -> None:
 
 
 def show_help() -> None:
+    """Affiche la liste des commandes."""
     ui.emit(
         ui.help_panel(
             "Commandes",
@@ -147,12 +160,14 @@ def show_help() -> None:
 
 
 def parse_command(text: str) -> tuple[str, list[str], str]:
+    """Découpe une commande en nom, arguments et reste du texte."""
     name, _, rest = text[1:].partition(" ")
     rest = rest.strip()
     return name.casefold(), rest.split(), rest
 
 
 def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
+    """Exécute une commande tapée ; renvoie False pour quitter."""
     name, args, rest = parse_command(text)
     if name == HELP:
         show_help()
@@ -176,6 +191,7 @@ def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
 
 
 def send_private(sock: socket.socket, rest: str) -> None:
+    """Vérifie puis envoie un message privé tapé avec /msg."""
     target, _, body = rest.partition(" ")
     body = body.strip()
     if not target or not body:
@@ -192,6 +208,7 @@ def send_private(sock: socket.socket, rest: str) -> None:
 
 
 def ask_username(prompt: str) -> str | None:
+    """Demande un pseudo ; renvoie None si l'utilisateur veut quitter."""
     while True:
         try:
             text = ui.read_line(f"{prompt} {ui.input_prompt()}").strip()
@@ -216,6 +233,7 @@ def ask_username(prompt: str) -> str | None:
 def choose_username(
     sock: socket.socket, messages: Iterator[dict]
 ) -> tuple[str, Iterator[dict]] | None:
+    """Négocie le pseudo ; renvoie le pseudo accepté et le flux à lire ensuite."""
     for message in messages:
         if message["type"] != SYSTEM:
             continue
@@ -244,6 +262,7 @@ def choose_username(
 def receive_messages(
     messages: Iterator[dict], stop: threading.Event, session: Session
 ) -> None:
+    """Affiche les messages reçus jusqu'à la fin de la connexion."""
     reason = "Connexion fermée par le serveur"
     try:
         for message in messages:
@@ -259,6 +278,7 @@ def receive_messages(
 
 
 def announce_closed(stop: threading.Event, reason: str) -> None:
+    """Signale une seule fois la fin de la connexion et débloque la saisie."""
     if stop.is_set():
         return
     stop.set()
@@ -268,6 +288,7 @@ def announce_closed(stop: threading.Event, reason: str) -> None:
 
 
 def interrupt_input() -> None:
+    """Interrompt l'attente de saisie du thread principal."""
     try:
         os.kill(os.getpid(), signal.SIGINT)
     except (AttributeError, OSError, ValueError):
@@ -277,6 +298,7 @@ def interrupt_input() -> None:
 def send_user_input(
     sock: socket.socket, stop: threading.Event, session: Session
 ) -> None:
+    """Lit le clavier et envoie messages et commandes jusqu'à l'arrêt."""
     try:
         while not stop.is_set():
             text = ui.read_line().strip()
@@ -306,6 +328,7 @@ def send_user_input(
 
 
 def parse_args() -> argparse.Namespace:
+    """Lit l'hôte et le port sur la ligne de commande."""
     parser = argparse.ArgumentParser(description="TCP chat client")
     parser.add_argument("host", nargs="?", default="localhost", help="Server host")
     parser.add_argument("port", nargs="?", type=int, default=12345, help="Server port")
@@ -313,6 +336,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Se connecte au serveur puis lance la réception et la saisie."""
     args = parse_args()
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

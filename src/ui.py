@@ -1,3 +1,5 @@
+"""L'affichage du client avec Rich : messages, panneaux et invite de saisie."""
+
 import sys
 import threading
 import time
@@ -42,10 +44,12 @@ _prompt_shown = False
 
 
 def readline_active() -> bool:
+    """Vrai si readline est disponible et que l'entrée est un terminal."""
     return readline is not None and sys.stdin.isatty()
 
 
 def input_prompt() -> str:
+    """Renvoie l'invite adaptée au terminal."""
     if readline_active():
         return READLINE_PROMPT
     if console.is_terminal:
@@ -54,10 +58,12 @@ def input_prompt() -> str:
 
 
 def user_style(username: str) -> str:
+    """Choisit une couleur stable pour un pseudo."""
     return USER_COLORS[zlib.crc32(username.casefold().encode()) % len(USER_COLORS)]
 
 
 def timestamp(when: float | None = None) -> str:
+    """Formate une heure en HH:MM:SS ; l'heure actuelle par défaut."""
     return time.strftime("%H:%M:%S", time.localtime(when))
 
 
@@ -87,6 +93,7 @@ def _line(
 
 
 def chat_line(username: str, text: str, *, mine: bool = False) -> Text:
+    """Met en forme un message public, aligné à droite si c'est le nôtre."""
     return _line(
         username,
         text,
@@ -96,6 +103,7 @@ def chat_line(username: str, text: str, *, mine: bool = False) -> Text:
 
 
 def private_line(other: str, text: str, *, mine: bool = False) -> Text:
+    """Met en forme un message privé envoyé ou reçu."""
     return _line(
         f"privé → {other}" if mine else f"privé ← {other}",
         text,
@@ -106,6 +114,7 @@ def private_line(other: str, text: str, *, mine: bool = False) -> Text:
 
 
 def history_line(username: str, text: str, when: float | None = None) -> Text:
+    """Met en forme un message de l'historique, en atténué."""
     return _line(
         username,
         text,
@@ -116,6 +125,7 @@ def history_line(username: str, text: str, when: float | None = None) -> Text:
 
 
 def system_line(text: str, style: str) -> Text:
+    """Met en forme une notification du serveur."""
     line = Text()
     line.append(timestamp(), style="dim")
     line.append("  · ", style="dim")
@@ -124,6 +134,7 @@ def system_line(text: str, style: str) -> Text:
 
 
 def help_panel(title: str, rows: list[tuple[str, str]], footer: str) -> Panel:
+    """Construit le panneau d'aide des commandes."""
     table = Table(box=SIMPLE, show_header=False, pad_edge=False, padding=(0, 2, 0, 0))
     table.add_column(style="bold cyan", no_wrap=True)
     table.add_column(style="cyan")
@@ -134,10 +145,12 @@ def help_panel(title: str, rows: list[tuple[str, str]], footer: str) -> Panel:
 
 
 def banner(text: str) -> Panel:
+    """Construit le bandeau de bienvenue."""
     return Panel(Text(text, style="green"), border_style="green", expand=False)
 
 
 def emit(renderable: RenderableType) -> None:
+    """Affiche un élément sans casser la ligne en cours de saisie."""
     justify = getattr(renderable, "justify", None)
     with _lock:
         redraw = _prompt_shown and readline_active()
@@ -151,16 +164,19 @@ def emit(renderable: RenderableType) -> None:
 
 
 def separator(title: str = "") -> None:
+    """Affiche une ligne de séparation avec un titre."""
     with _lock:
         console.rule(Text(title, style="dim"), style="dim")
 
 
 def awaiting_input() -> bool:
+    """Vrai si l'invite de saisie est affichée."""
     with _lock:
         return _prompt_shown
 
 
 def read_line(prompt: str | None = None) -> str:
+    """Lit une ligne au clavier en mémorisant que l'invite est affichée."""
     global _prompt_shown
     if prompt is None:
         prompt = input_prompt()

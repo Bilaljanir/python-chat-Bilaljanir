@@ -1,3 +1,5 @@
+"""Le protocole commun au client et au serveur : un message JSON par ligne."""
+
 import codecs
 import json
 import socket
@@ -51,6 +53,7 @@ class InvalidMessage(Exception):
 
 
 def chat_message(text: str, username: str | None = None) -> dict:
+    """Construit un message public ; le serveur y ajoute l'auteur."""
     payload = {"text": text}
     if username is not None:
         payload["username"] = username
@@ -58,10 +61,12 @@ def chat_message(text: str, username: str | None = None) -> dict:
 
 
 def system_message(event: str, text: str, **extra: object) -> dict:
+    """Construit une notification du serveur."""
     return {"type": SYSTEM, "payload": {"event": event, "text": text, **extra}}
 
 
 def private_message(text: str, to: str, username: str | None = None) -> dict:
+    """Construit un message privé destiné à un seul utilisateur."""
     payload = {"text": text, "to": to}
     if username is not None:
         payload["username"] = username
@@ -74,14 +79,17 @@ def history_message(entries: list[dict], more: bool = False) -> dict:
 
 
 def command_message(name: str, *args: str) -> dict:
+    """Construit une commande envoyée par le client."""
     return {"type": COMMAND, "payload": {"name": name, "args": list(args)}}
 
 
 def encode(message: dict) -> str:
+    """Sérialise un message en JSON compact, sur une seule ligne."""
     return json.dumps(message, ensure_ascii=False, separators=(",", ":"))
 
 
 def decode(line: str) -> dict:
+    """Lit une ligne JSON et vérifie qu'elle respecte le protocole."""
     try:
         message = json.loads(line)
     except json.JSONDecodeError as e:
@@ -156,14 +164,17 @@ def _checked_args(args: object) -> list[str]:
 
 
 def send_line(sock: socket.socket, text: str) -> None:
+    """Envoie une ligne de texte terminée par un retour à la ligne."""
     sock.sendall(f"{text}\n".encode())
 
 
 def send_message(sock: socket.socket, message: dict) -> None:
+    """Encode et envoie un message complet."""
     send_line(sock, encode(message))
 
 
 def enable_keepalive(sock: socket.socket) -> None:
+    """Active le keepalive TCP pour repérer un pair disparu."""
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except OSError:
@@ -187,6 +198,7 @@ def iter_messages(
     reader: "LineReader",
     on_invalid: Callable[[str, InvalidMessage], None],
 ) -> Iterator[dict]:
+    """Produit les messages valides reçus ; les autres vont à on_invalid."""
     for line in reader.lines():
         if not line.strip():
             continue
@@ -199,7 +211,10 @@ def iter_messages(
 
 
 class LineReader:
+    """Découpe le flux TCP en lignes, avec un délai d'inactivité optionnel."""
+
     def __init__(self, sock: socket.socket, idle_timeout: float | None = None) -> None:
+        """Prépare la lecture ; sans délai, elle attend sans limite."""
         self._sock = sock
         self._idle_timeout = idle_timeout
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -209,6 +224,7 @@ class LineReader:
         self.timed_out = False
 
     def lines(self) -> Iterator[str]:
+        """Renvoie l'itérateur des lignes reçues, toujours le même."""
         if self._lines is None:
             self._lines = self._iter_lines()
         return self._lines

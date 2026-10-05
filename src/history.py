@@ -1,3 +1,5 @@
+"""Les derniers messages publics, renvoyés aux clients qui arrivent."""
+
 import threading
 import time
 from collections import deque
@@ -16,5 +18,6 @@ def remember(text: str, username: str) -> None:
 
 
 def recent() -> list[dict]:
+    """Renvoie une copie des messages gardés, du plus ancien au plus récent."""
     with _lock:
         return list(_entries)

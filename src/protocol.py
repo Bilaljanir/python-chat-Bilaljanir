@@ -45,8 +45,10 @@ REQUIRED_FIELDS = {
 class MessageTooLong(Exception):
     """Une ligne dépasse MAX_MESSAGE_LEN caractères."""
 
+
 class InvalidMessage(Exception):
     """La ligne reçue n'est pas un message conforme au protocole."""
+
 
 def chat_message(text: str, username: str | None = None) -> dict:
     payload = {"text": text}
@@ -70,6 +72,7 @@ def history_message(entries: list[dict], more: bool = False) -> dict:
     """Un lot d'historique ; « more » annonce qu'un autre lot suit."""
     return {"type": HISTORY, "payload": {"messages": entries, "more": more}}
 
+
 def command_message(name: str, *args: str) -> dict:
     return {"type": COMMAND, "payload": {"name": name, "args": list(args)}}
 
@@ -79,7 +82,6 @@ def encode(message: dict) -> str:
 
 
 def decode(line: str) -> dict:
-
     try:
         message = json.loads(line)
     except json.JSONDecodeError as e:
@@ -162,7 +164,6 @@ def send_message(sock: socket.socket, message: dict) -> None:
 
 
 def enable_keepalive(sock: socket.socket) -> None:
-
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except OSError:
@@ -181,6 +182,7 @@ def enable_keepalive(sock: socket.socket) -> None:
         except OSError:
             pass
 
+
 def iter_messages(
     reader: "LineReader",
     on_invalid: Callable[[str, InvalidMessage], None],
@@ -197,7 +199,6 @@ def iter_messages(
 
 
 class LineReader:
-
     def __init__(self, sock: socket.socket, idle_timeout: float | None = None) -> None:
         self._sock = sock
         self._idle_timeout = idle_timeout

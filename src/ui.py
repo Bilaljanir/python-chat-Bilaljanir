@@ -4,7 +4,7 @@ import time
 import zlib
 
 from rich.box import SIMPLE
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -86,26 +86,22 @@ def _line(
     return line
 
 
-def chat_line(username: str, text: str, *, mine: bool = False, when: float | None = None) -> Text:
+def chat_line(username: str, text: str, *, mine: bool = False) -> Text:
     return _line(
         username,
         text,
         label_style=OWN_STYLE if mine else f"bold {user_style(username)}",
         mine=mine,
-        when=when,
     )
 
 
-def private_line(
-    other: str, text: str, *, mine: bool = False, when: float | None = None
-) -> Text:
+def private_line(other: str, text: str, *, mine: bool = False) -> Text:
     return _line(
         f"privé → {other}" if mine else f"privé ← {other}",
         text,
         label_style=f"bold {PRIVATE_STYLE}",
         text_style=PRIVATE_STYLE,
         mine=mine,
-        when=when,
     )
 
 
@@ -119,9 +115,9 @@ def history_line(username: str, text: str, when: float | None = None) -> Text:
     )
 
 
-def system_line(text: str, style: str, when: float | None = None) -> Text:
+def system_line(text: str, style: str) -> Text:
     line = Text()
-    line.append(timestamp(when), style="dim")
+    line.append(timestamp(), style="dim")
     line.append("  · ", style="dim")
     line.append(text, style=style)
     return line
@@ -137,12 +133,11 @@ def help_panel(title: str, rows: list[tuple[str, str]], footer: str) -> Panel:
     return Panel(table, title=title, border_style="cyan", title_align="left")
 
 
-def banner(text: str, style: str = "green") -> Panel:
-    return Panel(Text(text, style=style), border_style=style, expand=False)
+def banner(text: str) -> Panel:
+    return Panel(Text(text, style="green"), border_style="green", expand=False)
 
 
-def emit(renderable) -> None:
-
+def emit(renderable: RenderableType) -> None:
     justify = getattr(renderable, "justify", None)
     with _lock:
         redraw = _prompt_shown and readline_active()
@@ -166,7 +161,6 @@ def awaiting_input() -> bool:
 
 
 def read_line(prompt: str | None = None) -> str:
-
     global _prompt_shown
     if prompt is None:
         prompt = input_prompt()

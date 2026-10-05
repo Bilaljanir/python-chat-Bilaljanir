@@ -58,7 +58,6 @@ COMMAND_HELP = {
 
 
 class Session:
-
     def __init__(self, username: str) -> None:
         self._username = username
         self._lock = threading.Lock()
@@ -71,6 +70,7 @@ class Session:
     def rename(self, new_username: str) -> None:
         with self._lock:
             self._username = new_username
+
 
 def show_system(text: str, style: str = DEFAULT_SYSTEM_STYLE) -> None:
     ui.emit(ui.system_line(text, style))
@@ -122,14 +122,13 @@ def receive_history(messages: Iterator[dict]) -> Iterator[dict]:
 
 
 def display_private(payload: dict, session: Session) -> None:
-
     sender = payload.get("username", "?")
     mine = sender == session.username
     other = payload["to"] if mine else sender
     ui.emit(ui.private_line(other, payload["text"], mine=mine))
 
-def track_rename(payload: dict, session: Session) -> None:
 
+def track_rename(payload: dict, session: Session) -> None:
     if payload["event"] != RENAME or payload.get("username") != session.username:
         return
     new_username = payload.get("new_username")
@@ -175,8 +174,8 @@ def run_command(sock: socket.socket, text: str, stop: threading.Event) -> bool:
         show_system(f"Commande inconnue : /{name} — tapez /help", style="italic red")
     return True
 
-def send_private(sock: socket.socket, rest: str) -> None:
 
+def send_private(sock: socket.socket, rest: str) -> None:
     target, _, body = rest.partition(" ")
     body = body.strip()
     if not target or not body:
@@ -190,6 +189,7 @@ def send_private(sock: socket.socket, rest: str) -> None:
         )
         return
     send_message(sock, private_message(body, to=target))
+
 
 def ask_username(prompt: str) -> str | None:
     while True:
@@ -212,6 +212,7 @@ def ask_username(prompt: str) -> str | None:
         else:
             show_system("Ici, tapez un pseudo (ou /help, /quit).", style="italic red")
 
+
 def choose_username(
     sock: socket.socket, messages: Iterator[dict]
 ) -> tuple[str, Iterator[dict]] | None:
@@ -229,13 +230,16 @@ def choose_username(
             send_message(sock, command_message(NICK, proposal))
         elif event == WELCOME:
             ui.emit(ui.banner(payload["text"]))
-            show_system("Tapez /help pour la liste des commandes.", style="dim italic cyan")
+            show_system(
+                "Tapez /help pour la liste des commandes.", style="dim italic cyan"
+            )
             return payload.get("username", ""), receive_history(messages)
         else:
             show_system(payload["text"], SYSTEM_STYLES.get(event, DEFAULT_SYSTEM_STYLE))
 
     show_system("Connexion refusée par le serveur.", style="italic yellow")
     return None
+
 
 def receive_messages(
     messages: Iterator[dict], stop: threading.Event, session: Session
@@ -253,14 +257,15 @@ def receive_messages(
     finally:
         announce_closed(stop, reason)
 
-def announce_closed(stop: threading.Event, reason: str) -> None:
 
+def announce_closed(stop: threading.Event, reason: str) -> None:
     if stop.is_set():
         return
     stop.set()
     show_system(reason, style="italic yellow")
     if ui.awaiting_input():
         interrupt_input()
+
 
 def interrupt_input() -> None:
     try:
@@ -306,6 +311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("port", nargs="?", type=int, default=12345, help="Server port")
     return parser.parse_args()
 
+
 def main() -> None:
     args = parse_args()
     try:
@@ -342,6 +348,7 @@ def main() -> None:
         show_system(
             f"Le serveur a envoyé une ligne trop longue : {e}", style="italic red"
         )
+
 
 if __name__ == "__main__":
     main()

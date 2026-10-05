@@ -107,6 +107,7 @@ def shutdown_clients() -> int:
         drop_client(sock)
     return warned
 
+
 def broadcast(message: dict, sender: socket.socket | None = None) -> None:
     send_to(registry.targets(exclude=sender), message)
 
@@ -180,8 +181,8 @@ def post(sock: socket.socket, data: bytes) -> bool:
         outbox = _outboxes.get(sock)
     return outbox is not None and outbox.put(data)
 
-def try_send(sock: socket.socket, data: bytes) -> bool:
 
+def try_send(sock: socket.socket, data: bytes) -> bool:
     try:
         with send_lock(sock):
             _, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
@@ -200,8 +201,8 @@ def try_send_message(sock: socket.socket, message: dict) -> bool:
 def warn_client(sock: socket.socket, text: str) -> None:
     try_send_message(sock, system_message(ERROR, text))
 
-class InvalidMessageGuard:
 
+class InvalidMessageGuard:
     def __init__(
         self,
         conn: socket.socket,
@@ -228,8 +229,8 @@ class InvalidMessageGuard:
             raise TooManyInvalidMessages(f"{self.count} messages invalides")
         warn_client(self._conn, f"Message ignoré : {error}")
 
-def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | None:
 
+def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | None:
     for _ in range(MAX_NAME_ATTEMPTS):
         send_message(conn, system_message(ASK_USERNAME, "Choisissez un pseudo"))
         message = next(messages, None)
@@ -273,12 +274,14 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
     send_message(conn, system_message(ERROR, "Trop de tentatives, connexion fermée."))
     return None
 
+
 def username_proposal(message: dict) -> str | None:
     payload = message["payload"]
     if message["type"] != COMMAND or payload["name"] != NICK:
         return None
     name = payload["args"][0].strip() if payload["args"] else ""
     return name or None
+
 
 def handle_client(
     conn: socket.socket,
@@ -346,6 +349,7 @@ def handle_client(
             forget_send_lock(conn)
             sem.release()
 
+
 def history_frames(entries: list[dict]) -> list[dict]:
     budget = MAX_MESSAGE_LEN - len(encode(history_message([], more=False)))
     batches: list[list[dict]] = [[]]
@@ -372,6 +376,7 @@ def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
         if not relay_one(conn, username, message):
             return
 
+
 def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
     payload = message["payload"]
     if message["type"] == COMMAND:
@@ -395,20 +400,21 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
 
 
 def clean_text(conn: socket.socket, payload: dict) -> str | None:
-
     text = payload["text"].strip()
     if not text:
         return None
     if len(text) > MAX_TEXT_LEN:
         send_message(
             conn,
-            system_message(ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."),
+            system_message(
+                ERROR, f"Message trop long (max {MAX_TEXT_LEN} caractères)."
+            ),
         )
         return None
     return text
 
-def deliver_private(conn: socket.socket, username: str, payload: dict) -> bool:
 
+def deliver_private(conn: socket.socket, username: str, payload: dict) -> bool:
     text = clean_text(conn, payload)
     if text is None:
         return True
@@ -456,6 +462,7 @@ def user_list_message() -> dict:
         USER_LIST, f"Connectés ({len(names)}) : {listed}", users=names
     )
 
+
 def rename(conn: socket.socket, new_name: str) -> None:
     old_name = registry.current(conn)
     if new_name == old_name:
@@ -486,6 +493,7 @@ def rename(conn: socket.socket, new_name: str) -> None:
         ),
         sender=conn,
     )
+
 
 def positive_float(value: str) -> float:
     number = float(value)
@@ -536,14 +544,14 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+
 def serve(
     server_socket: socket.socket,
     max_clients: int,
     idle_timeout: float,
-    stop: threading.Event | None = None,
+    stop: threading.Event,
 ) -> None:
     sem = threading.Semaphore(max_clients)
-    stop = stop or threading.Event()
     server_socket.settimeout(ACCEPT_TIMEOUT)
     while not stop.is_set():
         if not sem.acquire(timeout=ACCEPT_TIMEOUT):

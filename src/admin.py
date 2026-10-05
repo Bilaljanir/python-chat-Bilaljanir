@@ -99,6 +99,7 @@ def status_table(
     )
     return table
 
+
 def activity_table(lines: list[tuple[float, int, str]]) -> Table:
     table = _grid()
     table.add_column(style="dim", no_wrap=True)
@@ -116,6 +117,7 @@ def activity_table(lines: list[tuple[float, int, str]]) -> Table:
             Text(message),
         )
     return table
+
 
 def dashboard(
     address: str,

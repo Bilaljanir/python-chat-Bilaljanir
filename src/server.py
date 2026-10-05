@@ -188,12 +188,17 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
                 WELCOME, f"Connecté en tant que {name}", username=name
             )
             frames = [welcome, *history_frames(backlog)]
+            # Borné comme les diffusions : un client qui ne lit pas ne doit
+            # pas garder son verrou d'écriture, que les autres attendent.
+            read_timeout = conn.gettimeout()
             try:
+                conn.settimeout(SEND_TIMEOUT)
                 conn.sendall("".join(f"{encode(f)}\n" for f in frames).encode())
             except OSError:
                 registry.release(conn)
                 raise
             finally:
+                conn.settimeout(read_timeout)
                 writing.release()
             return name
         writing.release()
@@ -310,10 +315,11 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
     text = clean_text(conn, payload)
     if text is None:
         return True
+    # L'envoi reste sous le verrou : chacun reçoit les messages dans l'ordre
+    # où l'historique les garde.
     with _chat_lock:
         history.remember(text, username)
-        socks = registry.targets(exclude=conn)
-    send_to(socks, chat_message(text, username=username))
+        send_to(registry.targets(exclude=conn), chat_message(text, username=username))
     return True
 
 

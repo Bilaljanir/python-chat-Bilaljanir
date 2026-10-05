@@ -131,9 +131,20 @@ def _checked_history(entries: object) -> list[dict]:
         if not isinstance(entry, dict) or not isinstance(entry.get("text"), str):
             raise InvalidMessage("entrée d'historique sans texte")
         _check_optional_text(entry, "username")
-        if "at" in entry and not isinstance(entry["at"], (int, float)):
-            raise InvalidMessage("champ « at » non numérique")
+        if "at" in entry and not _displayable_time(entry["at"]):
+            raise InvalidMessage("champ « at » non numérique ou hors limites")
     return entries
+
+
+def _displayable_time(value: object) -> bool:
+    """Vrai si l'heure peut être affichée : un nombre que localtime accepte."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        time.localtime(value)
+    except (OverflowError, OSError, ValueError):
+        return False
+    return True
 
 
 def _checked_args(args: object) -> list[str]:

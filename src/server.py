@@ -1,6 +1,7 @@
 import argparse
 import logging
 import math
+import queue
 import select
 import signal
 import socket
@@ -11,6 +12,7 @@ from collections.abc import Callable, Iterator
 from rich.console import Console, RenderableType
 
 import admin
+import history
 import registry
 from protocol import (
     ASK_USERNAME,
@@ -35,10 +37,13 @@ from protocol import (
     chat_message,
     enable_keepalive,
     encode,
+    history_message,
     iter_messages,
     private_message,
-    send_message,
     system_message,
+)
+from protocol import (
+    send_message as write_message,
 )
 
 console = Console()
@@ -50,6 +55,7 @@ MAX_NAME_ATTEMPTS = 3
 RETRY_DELAY = 0.1
 ACCEPT_TIMEOUT = 0.5
 SEND_TIMEOUT = 5.0
+OUTBOX_SIZE = 1024
 MAX_INVALID_MESSAGES = 10
 LOG_EXCERPT_LEN = 120
 SHUTDOWN_NOTICE = "Le serveur s'arrête, à bientôt."
@@ -60,8 +66,33 @@ LINE_TOO_LONG = f"Ligne de plus de {MAX_MESSAGE_LEN} caractères, connexion ferm
 class TooManyInvalidMessages(Exception):
     """Un client a dépassé son quota de messages illisibles."""
 
+
+_send_locks: dict[socket.socket, threading.Lock] = {}
+_send_locks_guard = threading.Lock()
+_chat_lock = threading.Lock()
+
+
+def send_lock(sock: socket.socket) -> threading.Lock:
+    """Le verrou d'écriture du client, créé au premier envoi."""
+    with _send_locks_guard:
+        return _send_locks.setdefault(sock, threading.Lock())
+
+
+def forget_send_lock(sock: socket.socket) -> None:
+    with _send_locks_guard:
+        _send_locks.pop(sock, None)
+
+
+def send_message(sock: socket.socket, message: dict) -> None:
+    """Écrit une trame complète : les threads ne s'entrelacent pas."""
+    with send_lock(sock):
+        write_message(sock, message)
+
+
 def drop_client(sock: socket.socket) -> None:
     registry.release(sock)
+    close_outbox(sock)
+    forget_send_lock(sock)
     try:
         sock.shutdown(socket.SHUT_RDWR)
     except OSError:
@@ -77,20 +108,86 @@ def shutdown_clients() -> int:
     return warned
 
 def broadcast(message: dict, sender: socket.socket | None = None) -> None:
+    send_to(registry.targets(exclude=sender), message)
+
+
+def send_to(socks: list[socket.socket], message: dict) -> None:
+    """Dépose le message dans la file de chaque client, sans jamais attendre."""
     data = f"{encode(message)}\n".encode()
-    unreachable = [
-        sock for sock in registry.targets(exclude=sender) if not try_send(sock, data)
-    ]
+    unreachable = [sock for sock in socks if not post(sock, data)]
     for sock in unreachable:
         drop_client(sock)
+
+
+class Outbox:
+    """La file d'envoi d'un client, vidée par un thread qui n'écrit que pour lui.
+
+    Un client lent ne fait attendre que ce thread : l'expéditeur, lui, se
+    contente de déposer, et peut le faire sous `_chat_lock` sans figer le chat.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._queue: queue.Queue[bytes | None] = queue.Queue(OUTBOX_SIZE)
+        self._closed = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def put(self, data: bytes) -> bool:
+        if self._closed.is_set():
+            return False
+        try:
+            self._queue.put_nowait(data)
+        except queue.Full:
+            return False
+        return True
+
+    def close(self) -> None:
+        self._closed.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass  # le thread écrit ; il verra `_closed` après cette trame
+
+    def _run(self) -> None:
+        while not self._closed.is_set():
+            data = self._queue.get()
+            if data is None or self._closed.is_set():
+                return
+            if not try_send(self._sock, data):
+                drop_client(self._sock)
+                return
+
+
+_outboxes: dict[socket.socket, Outbox] = {}
+_outboxes_guard = threading.Lock()
+
+
+def open_outbox(sock: socket.socket) -> None:
+    with _outboxes_guard:
+        _outboxes[sock] = Outbox(sock)
+
+
+def close_outbox(sock: socket.socket) -> None:
+    with _outboxes_guard:
+        outbox = _outboxes.pop(sock, None)
+    if outbox is not None:
+        outbox.close()
+
+
+def post(sock: socket.socket, data: bytes) -> bool:
+    """Faux si le client est parti ou si sa file déborde : il ne suit plus."""
+    with _outboxes_guard:
+        outbox = _outboxes.get(sock)
+    return outbox is not None and outbox.put(data)
 
 def try_send(sock: socket.socket, data: bytes) -> bool:
 
     try:
-        _, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
-        if not writable:
-            return False
-        sock.sendall(data)
+        with send_lock(sock):
+            _, writable, _ = select.select((), (sock,), (), SEND_TIMEOUT)
+            if not writable:
+                return False
+            sock.sendall(data)
     except (OSError, ValueError):
         return False
     return True
@@ -147,19 +244,30 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
             )
             continue
 
-        refusal = registry.claim(conn, name)
+        writing = send_lock(conn)
+        with _chat_lock:
+            writing.acquire()
+            refusal = registry.claim(conn, name)
+            backlog = history.recent() if refusal is None else []
         if refusal is None:
+            welcome = system_message(
+                WELCOME, f"Connecté en tant que {name}", username=name
+            )
+            frames = [welcome, *history_frames(backlog)]
+            # Borné comme les diffusions : un client qui ne lit pas ne doit
+            # pas garder son verrou d'écriture, que les autres attendent.
+            read_timeout = conn.gettimeout()
             try:
-                send_message(
-                    conn,
-                    system_message(
-                        WELCOME, f"Connecté en tant que {name}", username=name
-                    ),
-                )
+                conn.settimeout(SEND_TIMEOUT)
+                conn.sendall("".join(f"{encode(f)}\n" for f in frames).encode())
             except OSError:
                 registry.release(conn)
                 raise
+            finally:
+                conn.settimeout(read_timeout)
+                writing.release()
             return name
+        writing.release()
         send_message(conn, system_message(ERROR, refusal))
 
     send_message(conn, system_message(ERROR, "Trop de tentatives, connexion fermée."))
@@ -182,6 +290,9 @@ def handle_client(
     username: str | None = None
     reader = LineReader(conn, idle_timeout)
     messages = iter_messages(reader, InvalidMessageGuard(conn, address))
+    # Ouverte avant tout `claim` : dès qu'il est inscrit, le client peut être
+    # destinataire d'une diffusion.
+    open_outbox(conn)
 
     try:
         with conn:
@@ -231,7 +342,27 @@ def handle_client(
         except Exception:
             logger.exception("Nettoyage incomplet pour %s:%s", host, port)
         finally:
+            close_outbox(conn)
+            forget_send_lock(conn)
             sem.release()
+
+def history_frames(entries: list[dict]) -> list[dict]:
+    budget = MAX_MESSAGE_LEN - len(encode(history_message([], more=False)))
+    batches: list[list[dict]] = [[]]
+    used = 0
+    for entry in entries:
+        size = len(encode(entry))
+        if size > budget:
+            logger.warning("Message trop long pour l'historique, ignoré")
+            continue
+        if batches[-1] and used + 1 + size > budget:
+            batches.append([])
+            used = 0
+        used += size + (1 if batches[-1] else 0)
+        batches[-1].append(entry)
+    last = len(batches) - 1
+    return [history_message(batch, more=i < last) for i, batch in enumerate(batches)]
+
 
 def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
     for message in messages:
@@ -254,7 +385,12 @@ def relay_one(conn: socket.socket, username: str, message: dict) -> bool:
     text = clean_text(conn, payload)
     if text is None:
         return True
-    broadcast(chat_message(text, username=username), sender=conn)
+    # Le dépôt dans les files se fait sous le verrou : chacun reçoit les
+    # messages dans l'ordre où l'historique les garde. Déposer n'écrit rien
+    # sur le réseau, un client lent ne retient donc pas le verrou.
+    with _chat_lock:
+        history.remember(text, username)
+        send_to(registry.targets(exclude=conn), chat_message(text, username=username))
     return True
 
 

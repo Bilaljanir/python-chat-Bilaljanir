@@ -265,6 +265,10 @@ Chaque thread rend son permis (`sem.release()`) en partant, **quel que soit le
 chemin de sortie** — c'est pour ça qu'il est placé tout à la fin de
 `handle_client`, hors du `try`.
 
+Chaque client a en fait **deux threads** : celui qui lit (`handle_client`) et
+celui qui vide sa file d'envoi (`Outbox`). Le second passe son temps bloqué
+sur la file, et il s'arrête quand le client part (`close_outbox`).
+
 ### Le registre
 
 Il vit dans `registry.py`, à lui seul :
@@ -306,22 +310,28 @@ existe.
 
 ```python
 def broadcast(message, sender=None):
+    send_to(registry.targets(exclude=sender), message)  # targets() rend une copie
+
+def send_to(socks, message):
     data = f"{encode(message)}\n".encode()   # sérialisé une fois pour tous
-    unreachable = [                          # registry.targets() rend une copie
-        sock for sock in registry.targets(exclude=sender) if not try_send(sock, data)
-    ]
+    unreachable = [sock for sock in socks if not post(sock, data)]
     for sock in unreachable:
         drop_client(sock)
 ```
 
-Trois décisions dans ces six lignes :
+Trois décisions dans ces lignes :
 
-1. **`sock is not sender`** : c'est ce qui implémente « l'auteur ne reçoit pas
+1. **`exclude=sender`** : c'est ce qui implémente « l'auteur ne reçoit pas
    son propre message ». Le message est aussi **sérialisé une seule fois**,
    avant la boucle : le JSON envoyé est identique pour tous les destinataires.
-2. **Le verrou n'est tenu que pour la copie**, pas pendant les envois. Un
-   `sendall` peut bloquer si le tampon d'un client est plein ; le tenir sous
-   verrou figerait tout le chat à cause d'un seul client lent.
+2. **Diffuser n'écrit rien sur le réseau.** `post()` dépose la trame dans la
+   file d'envoi du client (`Outbox`), et un thread propre à ce client la vide.
+   Un `sendall` peut bloquer si le tampon d'un client est plein ; c'est ce
+   thread-là qui attend, jamais l'expéditeur. C'est ce qui permet à
+   `relay_one()` de déposer un message **sous `_chat_lock`** : les messages
+   arrivent à chacun dans l'ordre où l'historique les garde, et un client lent
+   ne fige pas le chat pour autant. Une file pleine (`OUTBOX_SIZE` trames en
+   retard) veut dire que le client ne suit plus : il est déconnecté.
 3. **Un socket qui refuse l'envoi est purgé** — et `drop_client` fait un
    `shutdown`, pas seulement un retrait du registre. Sans ce `shutdown`, le
    client resterait connecté, capable d'envoyer, mais ne recevrait plus rien.
@@ -516,6 +526,7 @@ la forme actuelle du code.
 | `NAME_PATTERN` | `^[\w.-]{1,24}$` | `registry.py` | pseudos acceptés |
 | `ACCEPT_TIMEOUT` | 0.5 | `server.py` | secondes avant que la boucle d'accueil relise `stop` |
 | `SEND_TIMEOUT` | 5 | `server.py` | secondes d'attente avant de lâcher un client qui ne lit plus |
+| `OUTBOX_SIZE` | 1024 | `server.py` | trames en attente d'envoi avant de lâcher un client qui ne suit plus |
 | `MAX_INVALID_MESSAGES` | 10 | `server.py` | lignes illisibles tolérées avant fermeture |
 | `KEEPALIVE_IDLE` / `_INTERVAL` / `_COUNT` | 30 / 10 / 3 | `protocol.py` | sondes TCP : un pair disparu est repéré en ~1 min |
 | `ACTIVITY_LINES` | 12 | `admin.py` | lignes de journal gardées en mémoire |
@@ -730,9 +741,13 @@ d'inactivité. Le baisser à cinq secondes depuis un autre thread, le temps d'un
 envoi, ferait expirer la lecture d'en face — et déconnecterait pour « silence »
 un client parfaitement bavard. `select()` ne touche à rien.
 
-Un envoi qui échoue n'est pas rattrapé : `broadcast()` collecte les sockets
-muettes et les passe à `drop_client()`. Le thread du client concerné se réveille
-sur la fermeture et fait son nettoyage habituel.
+Pour les diffusions, cette attente a lieu dans le thread d'envoi du client
+(voir `Outbox`), pas dans celui de l'expéditeur : le client figé ne retarde que
+lui-même.
+
+Un envoi qui échoue n'est pas rattrapé : la socket muette passe par
+`drop_client()`, qui ferme aussi sa file d'envoi. Le thread du client concerné
+se réveille sur la fermeture et fait son nettoyage habituel.
 
 ### Repérer un pair qui a disparu
 

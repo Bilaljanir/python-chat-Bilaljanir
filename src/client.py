@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import os
 import signal
 import socket
@@ -11,6 +12,7 @@ from protocol import (
     CHAT,
     ERROR,
     HELP,
+    HISTORY,
     JOIN,
     LEAVE,
     MAX_TEXT_LEN,
@@ -89,6 +91,34 @@ def display(message: dict, session: Session) -> None:
         show_system(
             payload["text"], SYSTEM_STYLES.get(payload["event"], DEFAULT_SYSTEM_STYLE)
         )
+
+
+def receive_history(messages: Iterator[dict]) -> Iterator[dict]:
+    """Affiche les lots d'historique envoyés juste après l'accueil.
+
+    Renvoie le flux à lire ensuite : une trame qui n'est pas de l'historique
+    y est remise en tête au lieu d'être perdue.
+    """
+    shown = False
+    for message in messages:
+        if message["type"] != HISTORY:
+            messages = itertools.chain([message], messages)
+            break
+        payload = message["payload"]
+        for entry in payload["messages"]:
+            if not shown:
+                ui.separator("messages précédents")
+                shown = True
+            ui.emit(
+                ui.history_line(
+                    entry.get("username", "?"), entry["text"], entry.get("at")
+                )
+            )
+        if not payload.get("more", False):
+            break
+    if shown:
+        ui.separator("fin des messages précédents")
+    return messages
 
 
 def display_private(payload: dict, session: Session) -> None:
@@ -182,7 +212,9 @@ def ask_username(prompt: str) -> str | None:
         else:
             show_system("Ici, tapez un pseudo (ou /help, /quit).", style="italic red")
 
-def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None:
+def choose_username(
+    sock: socket.socket, messages: Iterator[dict]
+) -> tuple[str, Iterator[dict]] | None:
     for message in messages:
         if message["type"] != SYSTEM:
             continue
@@ -198,7 +230,7 @@ def choose_username(sock: socket.socket, messages: Iterator[dict]) -> str | None
         elif event == WELCOME:
             ui.emit(ui.banner(payload["text"]))
             show_system("Tapez /help pour la liste des commandes.", style="dim italic cyan")
-            return payload.get("username", "")
+            return payload.get("username", ""), receive_history(messages)
         else:
             show_system(payload["text"], SYSTEM_STYLES.get(event, DEFAULT_SYSTEM_STYLE))
 
@@ -287,9 +319,10 @@ def main() -> None:
             show_system(f"Connecté à {args.host}:{args.port}", style="italic green")
 
             messages = iter_messages(LineReader(sock), report_invalid)
-            username = choose_username(sock, messages)
-            if username is None:
+            joined = choose_username(sock, messages)
+            if joined is None:
                 return
+            username, messages = joined
 
             session = Session(username)
             ui.separator("conversation")

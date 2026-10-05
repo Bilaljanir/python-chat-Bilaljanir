@@ -67,9 +67,6 @@ class TooManyInvalidMessages(Exception):
 
 _send_locks: dict[socket.socket, threading.Lock] = {}
 _send_locks_guard = threading.Lock()
-# Rend atomiques « mémoriser + choisir les destinataires » d'un message public
-# et « s'inscrire + photographier l'historique » d'un arrivant : chaque message
-# lui parvient soit dans l'historique, soit en direct, jamais les deux.
 _chat_lock = threading.Lock()
 
 
@@ -187,17 +184,12 @@ def negotiate_username(conn: socket.socket, messages: Iterator[dict]) -> str | N
             refusal = registry.claim(conn, name)
             backlog = history.recent() if refusal is None else []
         if refusal is None:
-            # Les envois des autres threads attendent ce verrou : l'accueil et
-            # l'historique passent avant tout message en direct.
+            welcome = system_message(
+                WELCOME, f"Connecté en tant que {name}", username=name
+            )
+            frames = [welcome, *history_frames(backlog)]
             try:
-                write_message(
-                    conn,
-                    system_message(
-                        WELCOME, f"Connecté en tant que {name}", username=name
-                    ),
-                )
-                for frame in history_frames(backlog):
-                    write_message(conn, frame)
+                conn.sendall("".join(f"{encode(f)}\n" for f in frames).encode())
             except OSError:
                 registry.release(conn)
                 raise
@@ -279,23 +271,22 @@ def handle_client(
             forget_send_lock(conn)
             sem.release()
 
-
 def history_frames(entries: list[dict]) -> list[dict]:
-    """Découpe l'historique en lots qui tiennent chacun dans une ligne."""
+    budget = MAX_MESSAGE_LEN - len(encode(history_message([], more=False)))
     batches: list[list[dict]] = [[]]
+    used = 0
     for entry in entries:
-        if history_fits(batches[-1] + [entry]):
-            batches[-1].append(entry)
-        elif history_fits([entry]):
-            batches.append([entry])
-        else:
+        size = len(encode(entry))
+        if size > budget:
             logger.warning("Message trop long pour l'historique, ignoré")
+            continue
+        if batches[-1] and used + 1 + size > budget:
+            batches.append([])
+            used = 0
+        used += size + (1 if batches[-1] else 0)
+        batches[-1].append(entry)
     last = len(batches) - 1
     return [history_message(batch, more=i < last) for i, batch in enumerate(batches)]
-
-
-def history_fits(batch: list[dict]) -> bool:
-    return len(encode(history_message(batch, more=True))) <= MAX_MESSAGE_LEN
 
 
 def relay_messages(conn: socket.socket, messages: Iterator[dict]) -> None:
